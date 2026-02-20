@@ -1,0 +1,143 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+env:
+  SWIFT_VERSION: "6.1"
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: swift build
+
+      - name: Test
+        run: swift test
+
+  release:
+    name: Release
+    needs: build-and-test
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build release binary
+        run: swift build -c release
+
+      - name: Create app bundle
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          APP_DIR="ErrandDesktop.app/Contents/MacOS"
+          mkdir -p "$APP_DIR"
+          cp .build/release/ErrandDesktop "$APP_DIR/"
+
+          TAG="$REF_NAME"
+          VERSION="${TAG#v}"
+          if [[ ! "$TAG" =~ ^v ]]; then
+            VERSION="0.0.0"
+          fi
+
+          cat > "ErrandDesktop.app/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>ErrandDesktop</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.errand.desktop</string>
+              <key>CFBundleName</key>
+              <string>ErrandDesktop</string>
+              <key>CFBundleVersion</key>
+              <string>${VERSION}</string>
+              <key>CFBundleShortVersionString</key>
+              <string>${VERSION}</string>
+              <key>LSMinimumSystemVersion</key>
+              <string>26.0</string>
+              <key>LSUIElement</key>
+              <true/>
+          </dict>
+          </plist>
+          PLIST
+          cp ErrandDesktop.entitlements "ErrandDesktop.app/Contents/"
+
+      - name: Import signing certificate
+        env:
+          CERTIFICATE_P12: ${{ secrets.CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          echo "$CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" \
+            -P "$CERTIFICATE_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+      - name: Sign app bundle
+        run: |
+          codesign --deep --force --verify --verbose \
+            --sign "Developer ID Application" \
+            --options runtime \
+            --entitlements ErrandDesktop.entitlements \
+            "ErrandDesktop.app"
+
+      - name: Create DMG
+        run: |
+          chmod +x scripts/create-dmg.sh
+          scripts/create-dmg.sh ErrandDesktop.app ErrandDesktop.dmg
+
+      - name: Sign DMG
+        run: |
+          codesign --force --verify --verbose \
+            --sign "Developer ID Application" \
+            ErrandDesktop.dmg
+
+      - name: Notarize
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          TEAM_ID: ${{ secrets.TEAM_ID }}
+        run: |
+          xcrun notarytool submit ErrandDesktop.dmg \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$TEAM_ID" \
+            --wait
+
+          xcrun stapler staple ErrandDesktop.dmg
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ErrandDesktop.dmg
+          path: ErrandDesktop.dmg
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ErrandDesktop.dmg
+          generate_release_notes: true

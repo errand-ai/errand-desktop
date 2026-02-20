@@ -11,6 +11,7 @@ struct ErrandDesktopApp: App {
         } label: {
             Image(systemName: appState.menuBarIconName)
         }
+        .menuBarExtraStyle(.window)
 
         Settings {
             SettingsView()
