@@ -67,8 +67,12 @@ struct MenuBarPopover: View {
                         .frame(width: 8, height: 8)
                     Text(service.displayName)
                     Spacer()
-                    if let port = service.port {
-                        Text(":\(port)")
+                    if service.status != .stopped && service.status != .running {
+                        Text(service.status.label)
+                            .font(.caption)
+                            .foregroundStyle(service.status.color)
+                    } else if let port = service.port {
+                        Text(verbatim: "Port \(port)")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .monospacedDigit()
@@ -85,12 +89,26 @@ struct MenuBarPopover: View {
         VStack(spacing: 6) {
             HStack(spacing: 8) {
                 Button("Start All") {
-                    Task { try? await appState.startAll() }
+                    Task {
+                        do {
+                            try await appState.startAll()
+                        } catch {
+                            appState.appendLog(service: "app", message: "Start failed: \(error)")
+                            print("[StartAll] Error: \(error)")
+                        }
+                    }
                 }
                 .disabled(appState.services.allSatisfy { $0.status == .running })
 
                 Button("Stop All") {
-                    Task { try? await appState.stopAll() }
+                    Task {
+                        do {
+                            try await appState.stopAll()
+                        } catch {
+                            appState.appendLog(service: "app", message: "Stop failed: \(error)")
+                            print("[StopAll] Error: \(error)")
+                        }
+                    }
                 }
                 .disabled(appState.services.allSatisfy { $0.status == .stopped })
             }
@@ -140,9 +158,21 @@ extension ServiceStatus {
     var color: Color {
         switch self {
         case .running: .green
+        case .pulling: .blue
         case .starting, .stopping: .orange
         case .error: .red
         case .stopped: .gray
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .stopped: "Stopped"
+        case .pulling: "Pulling..."
+        case .starting: "Starting..."
+        case .running: "Running"
+        case .stopping: "Stopping..."
+        case .error: "Error"
         }
     }
 }

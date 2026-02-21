@@ -1,4 +1,4 @@
-// swift-tools-version: 6.1
+// swift-tools-version: 6.2
 
 import PackageDescription
 
@@ -7,17 +7,24 @@ let package = Package(
     platforms: [
         .macOS(.v26)
     ],
+    products: [
+        .executable(name: "ErrandDesktop", targets: ["ErrandDesktop"]),
+    ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-containerization.git", from: "0.9.0"),
+        .package(url: "https://github.com/apple/containerization.git", from: "0.26.0"),
     ],
     targets: [
         .executableTarget(
             name: "ErrandDesktop",
             dependencies: [
-                .product(name: "Containerization", package: "swift-containerization"),
-                .product(name: "ContainerizationOCI", package: "swift-containerization"),
+                .product(name: "Containerization", package: "containerization"),
+                .product(name: "ContainerizationOCI", package: "containerization"),
+                .product(name: "ContainerizationEXT4", package: "containerization"),
             ],
-            path: "Sources/ErrandDesktop"
+            path: "Sources/ErrandDesktop",
+            resources: [
+                .process("Resources"),
+            ]
         ),
         .testTarget(
             name: "ErrandDesktopTests",

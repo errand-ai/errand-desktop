@@ -21,6 +21,18 @@ struct SettingsView: View {
                 .tabItem { Label("Ports", systemImage: "network") }
         }
         .frame(width: 450, height: 300)
+        .onAppear {
+            NSApp.setActivationPolicy(.regular)
+            NSApp.activate()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                for window in NSApp.windows where window.isVisible {
+                    window.makeKeyAndOrderFront(nil)
+                }
+            }
+        }
+        .onDisappear {
+            NSApp.setActivationPolicy(.accessory)
+        }
     }
 }
 
@@ -29,6 +41,8 @@ struct SettingsView: View {
 private struct GeneralTab: View {
     @EnvironmentObject var appState: AppState
     @State private var isUpdatingLoginItem = false
+    @State private var availableTags: [String] = []
+    @State private var isLoadingTags = false
 
     var body: some View {
         Form {
@@ -51,9 +65,35 @@ private struct GeneralTab: View {
                 }
 
             LabeledContent("Image Tag") {
-                TextField("Tag", text: $appState.config.contentManagerImageTag)
-                    .frame(width: 200)
+                HStack(spacing: 6) {
+                    Picker("", selection: $appState.config.contentManagerImageTag) {
+                        if !availableTags.contains(appState.config.contentManagerImageTag) {
+                            Text(appState.config.contentManagerImageTag)
+                                .tag(appState.config.contentManagerImageTag)
+                        }
+                        ForEach(availableTags, id: \.self) { tag in
+                            Text(tag).tag(tag)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 180)
+
+                    if isLoadingTags {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Button(action: { Task { await fetchTags() } }) {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                }
             }
+
+            Toggle("Show beta versions", isOn: $appState.config.showBetaVersions)
+                .onChange(of: appState.config.showBetaVersions) {
+                    Task { await fetchTags() }
+                }
 
             HStack {
                 Spacer()
@@ -61,6 +101,20 @@ private struct GeneralTab: View {
             }
         }
         .padding()
+        .task { await fetchTags() }
+    }
+
+    private func fetchTags() async {
+        isLoadingTags = true
+        defer { isLoadingTags = false }
+        do {
+            availableTags = try await GHCRTagFetcher.fetchTags(
+                image: "errand-ai/errand-backend",
+                includeBeta: appState.config.showBetaVersions
+            )
+        } catch {
+            print("[GeneralTab] Failed to fetch tags: \(error)")
+        }
     }
 }
 
@@ -147,7 +201,7 @@ private struct PortsTab: View {
 
     private func portField(_ label: String, value: Binding<Int>) -> some View {
         LabeledContent(label) {
-            TextField("", value: value, format: .number)
+            TextField("", value: value, format: .number.grouping(.never))
                 .frame(width: 80)
                 .monospacedDigit()
         }

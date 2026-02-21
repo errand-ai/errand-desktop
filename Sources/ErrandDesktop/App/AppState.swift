@@ -6,6 +6,7 @@ import SwiftUI
 class AppState: ObservableObject {
     @Published var services: [ServiceInfo] = [
         ServiceInfo(id: "postgres", displayName: "PostgreSQL", port: 5432),
+        ServiceInfo(id: "migrate", displayName: "Migrate", isEphemeral: true),
         ServiceInfo(id: "valkey", displayName: "Valkey", port: 6379),
         ServiceInfo(id: "backend", displayName: "Backend", port: 8000),
         ServiceInfo(id: "worker", displayName: "Worker"),
@@ -24,13 +25,16 @@ class AppState: ObservableObject {
     private var healthChecker: HealthChecker?
     private(set) var liteLLMManager: LiteLLMManager?
     private var migrationRunner: MigrationRunner?
+    private var portForwarder = PortForwarder()
     private(set) var updateChecker = UpdateChecker()
 
     /// Overall status derived from service states.
     var appStatus: AppStatus {
-        let running = services.filter { $0.status == .running }
-        let starting = services.filter { $0.status == .starting }
-        let errored = services.filter { $0.status == .error }
+        // Exclude ephemeral services (like migrate) from status calculation
+        let longRunning = services.filter { !$0.isEphemeral }
+        let running = longRunning.filter { $0.status == .running }
+        let starting = longRunning.filter { $0.status == .starting || $0.status == .pulling }
+        let errored = longRunning.filter { $0.status == .error }
 
         if running.isEmpty && starting.isEmpty { return .idle }
         if !starting.isEmpty { return .starting }
@@ -48,7 +52,13 @@ class AppState: ObservableObject {
         }
     }
 
+    private var initialized = false
+
     func initialize() async {
+        guard !initialized else { return }
+        initialized = true
+
+        print("[AppState] Initializing...")
         storageManager = StorageManager()
         storageManager?.ensureDataDirectories()
 
@@ -69,6 +79,14 @@ class AppState: ObservableObject {
             await containerEngine?.setBridgeCredentials(token: token, port: 9876)
         }
 
+        // Get or create the credential encryption key from the macOS Keychain
+        do {
+            let encKey = try KeychainManager.getOrCreate(account: "credential-encryption-key")
+            await containerEngine?.setCredentialEncryptionKey(encKey)
+        } catch {
+            appendLog(service: "system", message: "Failed to load encryption key from Keychain: \(error.localizedDescription)")
+        }
+
         // Load persisted LiteLLM providers
         await liteLLMManager?.loadProviders()
 
@@ -86,28 +104,35 @@ class AppState: ObservableObject {
         // Start the bridge API server so the worker can create task-runner containers
         try await bridgeServer?.start()
 
-        // Start services in dependency order
-        try await containerEngine?.startAll(services: &services, config: config)
-
-        // Run Alembic migrations after Postgres is healthy, before backend serves
-        if let backendService = services.first(where: { $0.id == "backend" }),
-           let containerId = backendService.containerId {
-            let success = try await migrationRunner?.runAndReport(
-                backendContainerId: containerId,
-                onLog: { [weak self] service, message in
+        // Start services in dependency order with UI progress updates
+        if let engine = containerEngine {
+            services = try await engine.startAll(
+                services: services,
+                config: config,
+                onStatus: { [weak self] id, status in
                     Task { @MainActor in
-                        self?.appendLog(service: service, message: message)
+                        guard let self else { return }
+                        if let idx = self.services.firstIndex(where: { $0.id == id }) {
+                            self.services[idx].status = status
+                        }
+                    }
+                },
+                onLog: { [weak self] serviceId, line in
+                    Task { @MainActor in
+                        self?.appendLog(service: serviceId, message: line)
                     }
                 }
-            ) ?? true
+            )
+        }
 
-            if !success {
-                // Migration failed — mark backend as error, do not proceed
-                if let idx = services.firstIndex(where: { $0.id == "backend" }) {
-                    services[idx].status = .error
-                }
-                migrationError = "Database migration failed. Check logs for details."
-                return
+        // Set up port forwarding from localhost to container VMs
+        portForwarder.stopAll()
+        for service in services {
+            guard let port = service.port, let ip = service.containerIP else { continue }
+            do {
+                try portForwarder.forward(localPort: port, to: ip, remotePort: port)
+            } catch {
+                appendLog(service: service.id, message: "Port forwarding failed for port \(port): \(error.localizedDescription)")
             }
         }
 
@@ -131,8 +156,11 @@ class AppState: ObservableObject {
 
     func stopAll() async throws {
         healthChecker?.stopMonitoring()
+        portForwarder.stopAll()
         try? await liteLLMManager?.stop()
-        try await containerEngine?.stopAll(services: &services)
+        if let engine = containerEngine {
+            services = try await engine.stopAll(services: services)
+        }
         await bridgeServer?.stop()
     }
 
@@ -160,8 +188,11 @@ class AppState: ObservableObject {
             imagePullProgress[service.id] = 0.0
         }
         for service in services {
+            guard let imageRef = await containerEngine?.imageReference(for: service.id, config: config) else {
+                continue
+            }
             do {
-                try await containerEngine?.pullImage(name: service.id)
+                try await containerEngine?.pullImage(name: imageRef)
                 imagePullProgress[service.id] = 1.0
             } catch {
                 appendLog(service: service.id, message: "Failed to pull image: \(error.localizedDescription)")

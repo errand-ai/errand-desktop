@@ -8,8 +8,19 @@ struct ErrandDesktopApp: App {
         MenuBarExtra {
             MenuBarPopover()
                 .environmentObject(appState)
+                .task {
+                    await appState.initialize()
+                }
         } label: {
-            Image(systemName: appState.menuBarIconName)
+            if let url = Bundle.module.url(forResource: "menubar-icon", withExtension: "png"),
+               let nsImage = NSImage(contentsOf: url) {
+                Image(nsImage: {
+                    nsImage.size = NSSize(width: 18, height: 18)
+                    return nsImage
+                }())
+            } else {
+                Image(systemName: appState.menuBarIconName)
+            }
         }
         .menuBarExtraStyle(.window)
 

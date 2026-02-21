@@ -15,4 +15,5 @@ struct AppConfig: Codable, Sendable {
     var litellmPort: Int = 4000
     var launchAtLogin: Bool = false
     var contentManagerImageTag: String = "latest"
+    var showBetaVersions: Bool = false
 }

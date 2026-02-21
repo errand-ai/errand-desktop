@@ -61,15 +61,34 @@ struct SetupAssistantView: View {
             .padding(16)
         }
         .frame(width: 500, height: 420)
+        .onAppear {
+            // Menu bar apps (LSUIElement) can't receive keyboard focus by default.
+            // Temporarily become a regular app so the window can accept key input.
+            NSApp.setActivationPolicy(.regular)
+            NSApp.activate()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                for window in NSApp.windows where window.isVisible {
+                    window.makeKeyAndOrderFront(nil)
+                }
+            }
+        }
+        .onDisappear {
+            // Revert to accessory (menu-bar-only) when setup closes
+            NSApp.setActivationPolicy(.accessory)
+        }
     }
 
     // MARK: - Steps
 
     private var welcomeStep: some View {
         VStack(spacing: 12) {
-            Image(systemName: "shippingbox.fill")
-                .font(.system(size: 48))
-                .foregroundStyle(.accent)
+            if let url = Bundle.module.url(forResource: "errand-logo", withExtension: "png"),
+               let nsImage = NSImage(contentsOf: url) {
+                Image(nsImage: nsImage)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 80, height: 80)
+            }
 
             Text("Welcome to Errand Desktop")
                 .font(.title2.weight(.semibold))

@@ -1,0 +1,102 @@
+import Foundation
+import Security
+
+/// Manages secrets in the macOS Keychain.
+enum KeychainManager {
+
+    private static let service = "io.errand.ErrandDesktop"
+
+    /// Retrieves a value from the Keychain, or creates and stores a new random one.
+    static func getOrCreate(account: String, bytesCount: Int = 32) throws -> String {
+        if let existing = try get(account: account) {
+            return existing
+        }
+        let key = generateRandomKey(bytesCount: bytesCount)
+        try set(account: account, value: key)
+        return key
+    }
+
+    /// Retrieves a Keychain item by account name. Returns nil if not found.
+    static func get(account: String) throws -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+        if status == errSecItemNotFound {
+            return nil
+        }
+        guard status == errSecSuccess, let data = result as? Data,
+              let value = String(data: data, encoding: .utf8) else {
+            throw KeychainError.unhandledError(status: status)
+        }
+        return value
+    }
+
+    /// Stores a value in the Keychain. Overwrites if the account already exists.
+    static func set(account: String, value: String) throws {
+        guard let data = value.data(using: .utf8) else { return }
+
+        // Try to update first
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+        let update: [String: Any] = [
+            kSecValueData as String: data,
+        ]
+
+        let updateStatus = SecItemUpdate(query as CFDictionary, update as CFDictionary)
+        if updateStatus == errSecSuccess {
+            return
+        }
+
+        // Item doesn't exist — add it
+        var addQuery = query
+        addQuery[kSecValueData as String] = data
+        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+        guard addStatus == errSecSuccess else {
+            throw KeychainError.unhandledError(status: addStatus)
+        }
+    }
+
+    /// Deletes a Keychain item by account name.
+    static func delete(account: String) throws {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+        let status = SecItemDelete(query as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw KeychainError.unhandledError(status: status)
+        }
+    }
+
+    // MARK: - Private
+
+    private static func generateRandomKey(bytesCount: Int) -> String {
+        var bytes = [UInt8](repeating: 0, count: bytesCount)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytesCount, &bytes)
+        return Data(bytes).base64EncodedString()
+    }
+}
+
+enum KeychainError: Error, LocalizedError {
+    case unhandledError(status: OSStatus)
+
+    var errorDescription: String? {
+        switch self {
+        case .unhandledError(let status):
+            let msg = SecCopyErrorMessageString(status, nil) as String? ?? "Unknown"
+            return "Keychain error (\(status)): \(msg)"
+        }
+    }
+}

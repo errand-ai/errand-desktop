@@ -35,7 +35,7 @@ class HealthChecker {
     private func checkAll() async {
         for i in appState.services.indices {
             let service = appState.services[i]
-            guard service.status == .running else { continue }
+            guard service.status == .running, !service.isEphemeral else { continue }
 
             let healthy: Bool
             switch service.id {
@@ -76,7 +76,7 @@ class HealthChecker {
                 using: .tcp
             )
             let queue = DispatchQueue(label: "health-tcp-\(host):\(port)")
-            var resumed = false
+            nonisolated(unsafe) var resumed = false
 
             connection.stateUpdateHandler = { state in
                 guard !resumed else { return }

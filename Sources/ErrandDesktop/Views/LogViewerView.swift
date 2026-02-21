@@ -26,6 +26,15 @@ struct LogViewerView: View {
 
                 Spacer()
 
+                Button("Copy") {
+                    let text = filteredLogs.map { entry in
+                        let ts = entry.timestamp.formatted(.dateTime.hour().minute().second())
+                        return "[\(ts)] \(entry.service): \(entry.message)"
+                    }.joined(separator: "\n")
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(text, forType: .string)
+                }
+
                 Button("Clear") {
                     appState.logs.removeAll()
                 }

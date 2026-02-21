@@ -1,4 +1,5 @@
 import Foundation
+import Containerization
 
 /// A single LiteLLM model provider configuration entry.
 struct LiteLLMProvider: Codable, Identifiable, Sendable {
@@ -101,8 +102,8 @@ actor LiteLLMManager {
         }
 
         let env: [String: String] = [:]
-        let mounts: [String: String] = [
-            configFileURL.path: "/app/config.yaml",
+        let mounts: [Containerization.Mount] = [
+            .share(source: configFileURL.path, destination: "/app/config.yaml"),
         ]
 
         let (containerId, ip) = try await containerEngine.createAndStartContainer(
