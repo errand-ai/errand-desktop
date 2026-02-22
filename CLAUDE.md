@@ -59,7 +59,7 @@ HTTP parsing is hand-rolled in `HTTPTypes.swift` (no external HTTP server depend
 
 ### Keychain Integration
 
-`KeychainManager` stores the credential encryption key in the macOS Keychain (service: `io.errand.ErrandDesktop`). This key is injected into Backend/Worker containers as `CREDENTIAL_ENCRYPTION_KEY`.
+`KeychainManager` stores the credential encryption key in the macOS Keychain (service: `sh.errand.ErrandDesktop`). This key is injected into Backend/Worker containers as `CREDENTIAL_ENCRYPTION_KEY`.
 
 ## Key Conventions
 

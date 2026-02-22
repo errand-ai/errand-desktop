@@ -6,7 +6,7 @@ import Foundation
 actor BridgeServer {
     private let containerEngine: ContainerEngine
     private var listener: NWListener?
-    private let queue = DispatchQueue(label: "com.errand.bridge-server")
+    private let queue = DispatchQueue(label: "sh.errand.bridge-server")
 
     /// Bearer token for authenticating API requests.
     /// Generated at init; pass to worker container as CONTAINER_BRIDGE_TOKEN.

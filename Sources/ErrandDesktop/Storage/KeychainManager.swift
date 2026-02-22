@@ -4,7 +4,7 @@ import Security
 /// Manages secrets in the macOS Keychain.
 enum KeychainManager {
 
-    private static let service = "io.errand.ErrandDesktop"
+    private static let service = "sh.errand.ErrandDesktop"
 
     /// Retrieves a value from the Keychain, or creates and stores a new random one.
     static func getOrCreate(account: String, bytesCount: Int = 32) throws -> String {

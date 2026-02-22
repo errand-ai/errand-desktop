@@ -15,7 +15,7 @@ final class PortForwarder: @unchecked Sendable {
     }
 
     private var rules: [Rule] = []
-    private let queue = DispatchQueue(label: "io.errand.port-forwarder", attributes: .concurrent)
+    private let queue = DispatchQueue(label: "sh.errand.port-forwarder", attributes: .concurrent)
 
     /// Starts forwarding `localPort` on localhost to `remoteHost:remotePort`.
     func forward(localPort: Int, to remoteHost: String, remotePort: Int) throws {

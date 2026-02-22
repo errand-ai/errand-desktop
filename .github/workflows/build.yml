@@ -58,7 +58,7 @@ jobs:
               <key>CFBundleExecutable</key>
               <string>ErrandDesktop</string>
               <key>CFBundleIdentifier</key>
-              <string>com.errand.desktop</string>
+              <string>sh.errand.desktop</string>
               <key>CFBundleName</key>
               <string>ErrandDesktop</string>
               <key>CFBundleVersion</key>
@@ -73,6 +73,11 @@ jobs:
           </plist>
           PLIST
           cp ErrandDesktop.entitlements "ErrandDesktop.app/Contents/"
+
+          # Copy SPM resource bundles (needed for Bundle.module at runtime)
+          RESOURCES_DIR="ErrandDesktop.app/Contents/Resources"
+          mkdir -p "$RESOURCES_DIR"
+          cp -R .build/release/*.bundle "$RESOURCES_DIR/"
 
       - name: Import signing certificate
         env:
