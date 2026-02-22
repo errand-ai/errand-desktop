@@ -691,7 +691,7 @@ actor ContainerEngine {
             case "valkey":
                 images["valkey"] = "docker.io/valkey/valkey:8-alpine"
             case "backend", "worker", "migrate":
-                images[service.id] = "ghcr.io/errand-ai/errand-backend:\(config.contentManagerImageTag)"
+                images[service.id] = "ghcr.io/errand-ai/errand:\(config.contentManagerImageTag)"
             case "litellm":
                 images["litellm"] = "ghcr.io/berriai/litellm:latest"
             default:

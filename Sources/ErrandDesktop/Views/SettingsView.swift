@@ -109,7 +109,7 @@ private struct GeneralTab: View {
         defer { isLoadingTags = false }
         do {
             availableTags = try await GHCRTagFetcher.fetchTags(
-                image: "errand-ai/errand-backend",
+                image: "errand-ai/errand",
                 includeBeta: appState.config.showBetaVersions
             )
         } catch {

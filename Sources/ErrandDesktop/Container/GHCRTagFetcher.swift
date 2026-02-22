@@ -5,7 +5,7 @@ enum GHCRTagFetcher {
 
     /// Fetches all tags for a GHCR image, sorted newest-first by semver.
     /// - Parameters:
-    ///   - image: The image path (e.g. "errand-ai/errand-backend")
+    ///   - image: The image path (e.g. "errand-ai/errand")
     ///   - includeBeta: When true, include PR build tags (e.g. "0.50.0-pr55")
     /// - Returns: Sorted array of tag strings, newest first
     static func fetchTags(image: String, includeBeta: Bool = false) async throws -> [String] {

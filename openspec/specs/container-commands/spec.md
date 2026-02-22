@@ -16,7 +16,7 @@ A database migration container runs `alembic upgrade head` after Postgres is hea
 
 #### Scenario: Migration runs on startup
 - **WHEN** services are starting and Postgres is healthy
-- **THEN** a migrate container is created using the errand-backend image with command `alembic upgrade head`
+- **THEN** a migrate container is created using the errand image with command `alembic upgrade head`
 - **THEN** the system waits for the container to exit
 - **THEN** on exit code 0, the container is cleaned up and startup proceeds
 
