@@ -1,5 +1,7 @@
-import Testing
+import XCTest
 
-@Test func placeholder() {
-    #expect(true)
+final class ErrandDesktopTests: XCTestCase {
+    func testPlaceholder() {
+        XCTAssertTrue(true)
+    }
 }
