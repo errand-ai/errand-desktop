@@ -9,7 +9,7 @@ class AppState: ObservableObject {
         ServiceInfo(id: "valkey", displayName: "Valkey", port: 6379),
         ServiceInfo(id: "migrate", displayName: "Migrate", isEphemeral: true),
         ServiceInfo(id: "litellm", displayName: "LiteLLM", port: 4000),
-        ServiceInfo(id: "hindsight", displayName: "Hindsight", port: 8081, containerPort: 8888),
+        ServiceInfo(id: "hindsight", displayName: "Hindsight", port: 9999),
         ServiceInfo(id: "backend", displayName: "Errand Service", port: 8000),
         ServiceInfo(id: "worker", displayName: "Errand Agent"),
     ]
@@ -19,6 +19,7 @@ class AppState: ObservableObject {
     @Published var logs: [LogEntry] = []
     @Published var selectedLogService: String? = nil
     @Published var migrationError: String?
+    @Published var keychainError: String?
     @Published var imagePullProgress: [String: Double] = [:]
 
     private var containerEngine: ContainerEngine?
@@ -73,7 +74,7 @@ class AppState: ObservableObject {
 
         containerEngine = ContainerEngine()
         bridgeServer = BridgeServer(containerEngine: containerEngine!)
-        healthChecker = HealthChecker(appState: self)
+        healthChecker = HealthChecker(appState: self, containerEngine: containerEngine!)
         liteLLMManager = LiteLLMManager(containerEngine: containerEngine!)
         migrationRunner = MigrationRunner(containerEngine: containerEngine!)
 
@@ -82,27 +83,53 @@ class AppState: ObservableObject {
             await containerEngine?.setBridgeCredentials(token: token, port: 9876)
         }
 
-        // Get or create the credential encryption key from the macOS Keychain
-        do {
-            let encKey = try KeychainManager.getOrCreate(account: "credential-encryption-key")
-            await containerEngine?.setCredentialEncryptionKey(encKey)
-        } catch {
-            appendLog(service: "system", message: "Failed to load encryption key from Keychain: \(error.localizedDescription)")
-        }
+        // Request notification authorization early
+        await NotificationManager.requestAuthorization()
 
-        // Get or create the LiteLLM master key from the macOS Keychain (sk-<18 alphanumeric> format)
-        do {
-            let masterKey = try KeychainManager.getOrCreateLiteLLMKey()
-            await containerEngine?.setLiteLLMMasterKey(masterKey)
-        } catch {
-            appendLog(service: "system", message: "Failed to load LiteLLM master key from Keychain: \(error.localizedDescription)")
-        }
+        // Load secrets from the macOS Keychain with retry (keychain may be locked briefly after login)
+        await loadKeychainSecrets()
 
         // Load persisted LiteLLM providers
         await liteLLMManager?.loadProviders()
 
         // Start checking for updates
         updateChecker.startPeriodicChecks()
+    }
+
+    /// Loads credential encryption key and LiteLLM master key from the macOS Keychain.
+    /// Retries up to 3 times with a 1-second delay (the keychain may be briefly locked after login).
+    /// Sets `keychainError` if all attempts fail — callers must check this before starting containers.
+    private func loadKeychainSecrets() async {
+        keychainError = nil
+        let maxAttempts = 3
+
+        for attempt in 1...maxAttempts {
+            do {
+                let encKey = try KeychainManager.getOrCreate(account: "credential-encryption-key")
+                let masterKey = try KeychainManager.getOrCreateLiteLLMKey()
+                await containerEngine?.setCredentialEncryptionKey(encKey)
+                await containerEngine?.setLiteLLMMasterKey(masterKey)
+                appendLog(service: "system", message: "Keychain secrets loaded successfully")
+                return
+            } catch {
+                let msg = "Keychain attempt \(attempt)/\(maxAttempts) failed: \(error)"
+                appendLog(service: "system", message: msg)
+                try? msg.appending("\n").write(toFile: "/tmp/errand-keychain.log", atomically: true, encoding: .utf8)
+                if attempt < maxAttempts {
+                    try? await Task.sleep(for: .seconds(1))
+                }
+            }
+        }
+
+        let errorMsg = "Unable to read secrets from the macOS Keychain after \(maxAttempts) attempts. Services cannot start without encryption keys."
+        keychainError = errorMsg
+        appendLog(service: "system", message: errorMsg)
+        await NotificationManager.postKeychainError(errorMsg)
+    }
+
+    /// Retries loading keychain secrets (called from UI after user dismisses error).
+    func retryKeychainLoad() async {
+        await loadKeychainSecrets()
     }
 
     /// Launches startAll in a cancellable background task.
@@ -121,6 +148,11 @@ class AppState: ObservableObject {
     func startAll() async throws {
         migrationError = nil
 
+        // Refuse to start if keychain secrets are missing
+        if keychainError != nil {
+            throw AppError.keychainNotReady
+        }
+
         // Start the bridge API server so the worker can create task-runner containers
         try await bridgeServer?.start()
 
@@ -134,13 +166,16 @@ class AppState: ObservableObject {
             services = try await engine.startAll(
                 services: services,
                 config: config,
-                onStatus: { [weak self] id, status in
+                onStatus: { [weak self] id, status, containerIP in
                     Task { @MainActor in
                         guard let self else { return }
                         if let idx = self.services.firstIndex(where: { $0.id == id }) {
                             self.services[idx].status = status
+                            if let containerIP {
+                                self.services[idx].containerIP = containerIP
+                            }
 
-                            // Set up port forwarding as soon as the service is running
+                            // Set up port forwarding and notify as soon as the service is running
                             if status == .running {
                                 let service = self.services[idx]
                                 if let port = service.port, let ip = service.containerIP {
@@ -150,7 +185,17 @@ class AppState: ObservableObject {
                                     } catch {
                                         self.appendLog(service: id, message: "Port forwarding failed for port \(port): \(error.localizedDescription)")
                                     }
+                                    // Hindsight exposes both a UI (9999) and API (8888)
+                                    if id == "hindsight" {
+                                        do {
+                                            try self.portForwarder.forward(localPort: 8888, to: ip, remotePort: 8888)
+                                        } catch {
+                                            self.appendLog(service: id, message: "Port forwarding failed for port 8888: \(error.localizedDescription)")
+                                        }
+                                    }
                                 }
+                                let displayName = service.displayName
+                                Task { await NotificationManager.postServiceStarted(displayName) }
                             }
                         }
                     }
@@ -175,14 +220,33 @@ class AppState: ObservableObject {
     }
 
     func stopAll() async throws {
-        // Cancel any in-progress startup first
-        startTask?.cancel()
-        startTask = nil
+        // Cancel any in-progress startup and wait for it to finish so that
+        // containers mid-creation settle before we try to stop them.
+        if let task = startTask {
+            task.cancel()
+            startTask = nil
+            _ = try? await task.value
+        }
 
         healthChecker?.stopMonitoring()
         portForwarder.stopAll()
         if let engine = containerEngine {
-            services = try await engine.stopAll(services: services)
+            services = try await engine.stopAll(
+                services: services,
+                onStatus: { [weak self] id, status, _ in
+                    Task { @MainActor in
+                        guard let self else { return }
+                        if let idx = self.services.firstIndex(where: { $0.id == id }) {
+                            self.services[idx].status = status
+                        }
+                    }
+                },
+                onLog: { [weak self] message in
+                    Task { @MainActor in
+                        self?.appendLog(service: "app", message: message)
+                    }
+                }
+            )
         }
         await bridgeServer?.stop()
     }
@@ -234,6 +298,11 @@ class AppState: ObservableObject {
     func startSetupServices() async throws {
         guard let engine = containerEngine else { return }
 
+        // Refuse to start if keychain secrets are missing
+        if keychainError != nil {
+            throw AppError.keychainNotReady
+        }
+
         var serviceIPs: [String: String] = [:]
 
         let logCallback: @Sendable (String, String) -> Void = { [weak self] serviceId, line in
@@ -257,10 +326,13 @@ class AppState: ObservableObject {
                 services[pgIdx],
                 config: config,
                 serviceIPs: serviceIPs,
-                onStatus: { [weak self] id, status in
+                onStatus: { [weak self] id, status, containerIP in
                     Task { @MainActor in
                         if let idx = self?.services.firstIndex(where: { $0.id == id }) {
                             self?.services[idx].status = status
+                            if let containerIP {
+                                self?.services[idx].containerIP = containerIP
+                            }
                         }
                     }
                 },
@@ -278,10 +350,13 @@ class AppState: ObservableObject {
                 services[litellmIdx],
                 config: config,
                 serviceIPs: serviceIPs,
-                onStatus: { [weak self] id, status in
+                onStatus: { [weak self] id, status, containerIP in
                     Task { @MainActor in
                         if let idx = self?.services.firstIndex(where: { $0.id == id }) {
                             self?.services[idx].status = status
+                            if let containerIP {
+                                self?.services[idx].containerIP = containerIP
+                            }
                         }
                     }
                 },
@@ -364,6 +439,18 @@ class AppState: ObservableObject {
         }
     }
 
+}
+
+/// Errors that prevent the app from starting services.
+enum AppError: Error, LocalizedError {
+    case keychainNotReady
+
+    var errorDescription: String? {
+        switch self {
+        case .keychainNotReady:
+            return "Cannot start services: encryption keys could not be loaded from the macOS Keychain."
+        }
+    }
 }
 
 /// A single log entry from a container.

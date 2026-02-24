@@ -1,6 +1,19 @@
 @preconcurrency import Network
 import Foundation
 
+/// Debug log to file (mirrors ContainerEngine's debugLog).
+private func debugLog(_ message: String) {
+    let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
+    let logPath = "/tmp/errand-debug.log"
+    if let handle = FileHandle(forWritingAtPath: logPath) {
+        handle.seekToEndOfFile()
+        handle.write(line.data(using: .utf8)!)
+        handle.closeFile()
+    } else {
+        FileManager.default.createFile(atPath: logPath, contents: line.data(using: .utf8))
+    }
+}
+
 /// Local HTTP server exposing the container bridge API for the worker.
 /// Binds to the loopback interface only, authenticates via bearer token.
 actor BridgeServer {
@@ -17,10 +30,9 @@ actor BridgeServer {
         self.authToken = UUID().uuidString
     }
 
-    /// Start the HTTP server on the given port (loopback only).
+    /// Start the HTTP server on the given port (all interfaces, so containers can reach it).
     func start(port: UInt16 = 9876) throws {
         let params = NWParameters.tcp
-        params.requiredInterfaceType = .loopback
 
         guard let nwPort = NWEndpoint.Port(rawValue: port) else {
             throw BridgeServerError.invalidPort
@@ -31,7 +43,7 @@ actor BridgeServer {
 
         listener.stateUpdateHandler = { state in
             if case .ready = state {
-                print("[BridgeServer] Listening on 127.0.0.1:\(port)")
+                print("[BridgeServer] Listening on 0.0.0.0:\(port)")
             } else if case .failed(let error) = state {
                 print("[BridgeServer] Failed: \(error)")
             }
@@ -59,6 +71,14 @@ actor BridgeServer {
         do {
             let request = try await receiveRequest(from: connection)
 
+            // Unauthenticated: serves an auto-login page for the LiteLLM UI.
+            if request.method == "GET" && request.path == "/litellm-login" {
+                let response = handleLiteLLMLogin()
+                try await send(response, on: connection)
+                connection.cancel()
+                return
+            }
+
             guard authenticate(request) else {
                 try await send(.unauthorized, on: connection)
                 connection.cancel()
@@ -74,8 +94,10 @@ actor BridgeServer {
             }
 
             let response = await route(request)
+            debugLog("[BridgeServer] \(request.method) \(request.path) → \(response.statusCode)")
             try await send(response, on: connection)
         } catch {
+            debugLog("[BridgeServer] Request error: \(error)")
             try? await send(
                 .error(500, "Internal Server Error", message: "\(error)"),
                 on: connection
@@ -190,6 +212,7 @@ actor BridgeServer {
             )
             return .json(CreateContainerResponse(id: id), status: 201, statusText: "Created")
         } catch {
+            debugLog("[BridgeServer] POST /containers failed: \(error)")
             return .error(500, "Internal Server Error",
                           message: "Failed to create container: \(error)")
         }
@@ -250,6 +273,32 @@ actor BridgeServer {
             return .error(500, "Internal Server Error",
                           message: "Failed to remove container: \(error)")
         }
+    }
+
+    // MARK: - GET /litellm-login (unauthenticated)
+
+    /// Returns an HTML page that POSTs to LiteLLM's /v2/login via fetch(), setting
+    /// the auth cookie on localhost, then redirects to the LiteLLM UI.
+    /// Served from localhost:9876 so the cookie domain matches localhost:4000.
+    private func handleLiteLLMLogin() -> HTTPResponse {
+        guard let masterKey = try? KeychainManager.getOrCreateLiteLLMKey() else {
+            return .error(500, "Internal Server Error", message: "Unable to read LiteLLM key")
+        }
+
+        let html = """
+        <!DOCTYPE html><html><body><p>Logging in&hellip;</p><script>
+        fetch("http://localhost:4000/v2/login",{
+          method:"POST",
+          headers:{"Content-Type":"application/json"},
+          credentials:"include",
+          body:JSON.stringify({username:"admin",password:"\(masterKey)"})
+        }).then(r=>r.json()).then(d=>{
+          window.location.href=d.redirect_url||"http://localhost:4000/ui/";
+        }).catch(()=>{window.location.href="http://localhost:4000/ui/";});
+        </script></body></html>
+        """
+
+        return .html(html)
     }
 }
 

@@ -98,6 +98,16 @@ struct HTTPResponse: Sendable {
         json(["error": message], status: statusCode, statusText: statusText)
     }
 
+    /// Creates an HTML response.
+    static func html(_ body: String, status: Int = 200, statusText: String = "OK") -> HTTPResponse {
+        HTTPResponse(
+            statusCode: status,
+            statusText: statusText,
+            headers: [("Content-Type", "text/html; charset=utf-8")],
+            body: Data(body.utf8)
+        )
+    }
+
     static let noContent = HTTPResponse(
         statusCode: 204, statusText: "No Content", headers: [], body: Data()
     )

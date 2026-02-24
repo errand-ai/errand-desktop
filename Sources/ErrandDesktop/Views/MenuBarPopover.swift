@@ -10,7 +10,9 @@ struct MenuBarPopover: View {
             header
             Divider()
 
-            if appState.isFirstRun {
+            if let keychainError = appState.keychainError {
+                keychainErrorBanner(keychainError)
+            } else if appState.isFirstRun {
                 firstRunPrompt
             } else {
                 serviceList
@@ -42,6 +44,27 @@ struct MenuBarPopover: View {
         .padding(.vertical, 10)
     }
 
+    private func keychainErrorBanner(_ message: String) -> some View {
+        VStack(spacing: 8) {
+            Image(systemName: "exclamationmark.lock.fill")
+                .font(.title2)
+                .foregroundStyle(.red)
+            Text("Keychain Error")
+                .font(.subheadline.weight(.medium))
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Button("Retry") {
+                Task {
+                    await appState.retryKeychainLoad()
+                }
+            }
+        }
+        .padding()
+        .frame(maxWidth: .infinity)
+    }
+
     private var firstRunPrompt: some View {
         VStack(spacing: 8) {
             Text("Setup Required")
@@ -57,6 +80,13 @@ struct MenuBarPopover: View {
         .padding()
         .frame(maxWidth: .infinity)
     }
+
+    /// URLs for services that have a web UI, keyed by service id.
+    private static let webUIURLs: [String: String] = [
+        "litellm": "http://localhost:4000/ui",
+        "hindsight": "http://localhost:9999",
+        "backend": "http://localhost:8000",
+    ]
 
     private var serviceList: some View {
         VStack(spacing: 2) {
@@ -76,6 +106,15 @@ struct MenuBarPopover: View {
                         Text(service.status.label)
                             .font(.caption)
                             .foregroundStyle(service.status.color)
+                    } else if service.status == .running, let urlString = Self.webUIURLs[service.id] {
+                        Button {
+                            openWebUI(serviceId: service.id, urlString: urlString)
+                        } label: {
+                            Text("Open")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
                     } else if let port = service.port {
                         Text(verbatim: "Port \(port)")
                             .font(.caption)
@@ -88,6 +127,23 @@ struct MenuBarPopover: View {
             }
         }
         .padding(.vertical, 6)
+    }
+
+    /// Opens a service's web UI. For LiteLLM, opens via the BridgeServer's login
+    /// endpoint which auto-authenticates using the master key.
+    private func openWebUI(serviceId: String, urlString: String) {
+        if serviceId == "litellm" {
+            // The BridgeServer serves an auto-login page at /litellm-login that
+            // POSTs to LiteLLM's /v2/login, sets the auth cookie on localhost,
+            // and redirects to the UI — no manual login needed.
+            if let url = URL(string: "http://localhost:9876/litellm-login") {
+                NSWorkspace.shared.open(url)
+                return
+            }
+        }
+        if let url = URL(string: urlString) {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     private var actionButtons: some View {
@@ -111,10 +167,6 @@ struct MenuBarPopover: View {
                 .disabled(appState.services.allSatisfy { $0.status == .stopped })
             }
 
-            Button("Open in Browser") {
-                appState.openInBrowser()
-            }
-            .disabled(appState.services.first { $0.id == "backend" }?.status != .running)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)

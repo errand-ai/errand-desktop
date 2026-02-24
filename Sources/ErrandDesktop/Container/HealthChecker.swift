@@ -5,13 +5,15 @@ import Foundation
 @MainActor
 class HealthChecker {
     private let appState: AppState
+    private let containerEngine: ContainerEngine
     private var monitoringTask: Task<Void, Never>?
 
     private let checkInterval: TimeInterval = 10
     private let maxFailures = 3
 
-    init(appState: AppState) {
+    init(appState: AppState, containerEngine: ContainerEngine) {
         self.appState = appState
+        self.containerEngine = containerEngine
     }
 
     func startMonitoring() {
@@ -37,6 +39,13 @@ class HealthChecker {
             let service = appState.services[i]
             guard service.status == .running, !service.isEphemeral else { continue }
 
+            // Fast path: if the container process has exited, mark it immediately
+            if await containerEngine.hasExited(serviceId: service.id) {
+                appState.services[i].status = .error
+                appState.appendLog(service: service.id, message: "\(service.displayName) container exited unexpectedly")
+                continue
+            }
+
             let healthy: Bool
             switch service.id {
             case "postgres":
@@ -45,10 +54,8 @@ class HealthChecker {
                 healthy = await tcpCheck(host: service.containerIP ?? "127.0.0.1", port: 6379)
             case "backend":
                 healthy = await httpCheck(host: service.containerIP ?? "127.0.0.1", port: 8000, path: "/health")
-            case "worker":
-                healthy = await processCheck(service: service)
             case "litellm":
-                healthy = await httpCheck(host: service.containerIP ?? "127.0.0.1", port: 4000, path: "/health")
+                healthy = await httpCheck(host: service.containerIP ?? "127.0.0.1", port: 4000, path: "/health/liveliness")
             case "hindsight":
                 healthy = await httpCheck(host: service.containerIP ?? "127.0.0.1", port: 8888, path: "/health")
             default:
@@ -61,7 +68,7 @@ class HealthChecker {
                 appState.services[i].healthCheckFailures += 1
                 if appState.services[i].healthCheckFailures >= maxFailures {
                     appState.services[i].status = .error
-                    print("[HealthChecker] \(service.displayName) marked unhealthy after \(maxFailures) failures")
+                    appState.appendLog(service: service.id, message: "\(service.displayName) failed \(maxFailures) consecutive health checks")
                 }
             }
         }
@@ -128,13 +135,4 @@ class HealthChecker {
         }
     }
 
-    // MARK: - Process Liveness Check
-
-    /// For the worker: checks that the container is still running by querying ContainerEngine.
-    private func processCheck(service: ServiceInfo) async -> Bool {
-        guard service.containerId != nil else { return false }
-        // If the container has a valid ID and status is .running, consider it alive.
-        // The container runtime would have already moved it to .error if the process exited.
-        return service.status == .running
-    }
 }

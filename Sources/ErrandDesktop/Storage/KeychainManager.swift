@@ -5,6 +5,17 @@ import Security
 enum KeychainManager {
 
     private static let service = "sh.errand.ErrandDesktop"
+    private static let accessGroup = "sh.errand.ErrandDesktop"
+
+    /// Base query attributes shared by all operations.
+    private static func baseQuery(account: String) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecAttrAccessGroup as String: accessGroup,
+        ]
+    }
 
     /// Retrieves a value from the Keychain, or creates and stores a new random one.
     static func getOrCreate(account: String, bytesCount: Int = 32) throws -> String {
@@ -28,13 +39,9 @@ enum KeychainManager {
 
     /// Retrieves a Keychain item by account name. Returns nil if not found.
     static func get(account: String) throws -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
+        var query = baseQuery(account: account)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
 
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
@@ -53,22 +60,12 @@ enum KeychainManager {
     static func set(account: String, value: String) throws {
         guard let data = value.data(using: .utf8) else { return }
 
-        // Try to update first
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
-        let update: [String: Any] = [
-            kSecValueData as String: data,
-        ]
+        let query = baseQuery(account: account)
 
-        let updateStatus = SecItemUpdate(query as CFDictionary, update as CFDictionary)
-        if updateStatus == errSecSuccess {
-            return
-        }
+        // Delete any existing item first to avoid errSecDuplicateItem from stale
+        // items left by a previous code signature.
+        SecItemDelete(query as CFDictionary)
 
-        // Item doesn't exist — add it
         var addQuery = query
         addQuery[kSecValueData as String] = data
         let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
@@ -79,11 +76,7 @@ enum KeychainManager {
 
     /// Deletes a Keychain item by account name.
     static func delete(account: String) throws {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
+        let query = baseQuery(account: account)
         let status = SecItemDelete(query as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw KeychainError.unhandledError(status: status)

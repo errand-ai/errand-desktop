@@ -85,6 +85,7 @@ class UpdateChecker: ObservableObject {
 
     /// Posts a macOS notification about the available update.
     private func postUpdateNotification(version: String, url: String) async {
+        guard Bundle.main.bundleIdentifier != nil else { return }
         let center = UNUserNotificationCenter.current()
 
         let settings = await center.notificationSettings()

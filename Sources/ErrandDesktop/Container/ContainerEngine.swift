@@ -60,6 +60,9 @@ actor ContainerEngine {
     /// Maps service IDs (e.g. "postgres") to container IDs.
     private var serviceContainerMap: [String: String] = [:]
 
+    /// Container IDs whose processes have exited (detected by background `wait()`).
+    private var exitedContainers: Set<String> = []
+
     /// Tracks task-runner containers created via the bridge API.
     private var taskContainers: [String: LinuxContainer] = [:]
 
@@ -77,6 +80,9 @@ actor ContainerEngine {
 
     /// Bridge API port, matches BridgeServer's listen port.
     var bridgePort: UInt16 = 9876
+
+    /// The vmnet gateway IP — containers use this to reach the host.
+    private var hostGatewayIP: String = "127.0.0.1"
 
     /// Credential encryption key from Keychain, injected into backend/worker containers.
     var credentialEncryptionKey: String = ""
@@ -143,6 +149,9 @@ actor ContainerEngine {
             }
             throw lastError!
         }()
+
+        hostGatewayIP = network.ipv4Gateway.description
+        debugLog("[ContainerEngine] vmnet gateway: \(hostGatewayIP)")
 
         manager = try await ContainerManager(
             kernel: kernel,
@@ -248,6 +257,25 @@ actor ContainerEngine {
         _ = try await imageStore.pull(reference: name)
     }
 
+    /// Expands short-form image references to fully-qualified form.
+    /// e.g. "nginx:latest" → "docker.io/library/nginx:latest",
+    ///      "myorg/myimage:v1" → "docker.io/myorg/myimage:v1"
+    /// Already-qualified references are returned unchanged.
+    static func qualifyImageReference(_ ref: String) -> String {
+        // Already has a domain (contains a dot or localhost)
+        let slashParts = ref.split(separator: "/", maxSplits: 1)
+        if slashParts.count >= 2 {
+            let firstPart = String(slashParts[0])
+            if firstPart.contains(".") || firstPart.contains(":") {
+                return ref // e.g. ghcr.io/org/image:tag or localhost:5000/image
+            }
+            // org/image form → docker.io/org/image
+            return "docker.io/\(ref)"
+        }
+        // Simple name like "nginx:latest" → docker.io/library/nginx:latest
+        return "docker.io/library/\(ref)"
+    }
+
     /// Returns the fully-qualified OCI image reference for a service ID.
     func imageReference(for serviceId: String, config: AppConfig) -> String? {
         let specs = imageSpecs(for: [ServiceInfo(id: serviceId, displayName: "")], config: config)
@@ -282,7 +310,7 @@ actor ContainerEngine {
         case "backend":    return   550_000_000  // ~527 MB measured (errand image)
         case "worker":     return   550_000_000  // ~527 MB measured (errand image)
         case "migrate":    return   550_000_000  // ~527 MB measured (errand image)
-        case "postgres":   return   250_000_000  // ~245 MB measured (alpine)
+        case "postgres":   return   450_000_000  // ~430 MB estimated (pgvector/pgvector:pg16, Debian-based)
         case "valkey":     return    15_000_000  // ~9 MB measured (alpine)
         default:           return   500_000_000  // conservative default
         }
@@ -310,35 +338,39 @@ actor ContainerEngine {
         // Use stable IDs for service containers so we can clean up deterministically
         let containerId = if let serviceId { "errand-\(serviceId)" } else { "errand-\(UUID().uuidString.prefix(8).lowercased())" }
 
-        // Remove any leftover container directory from a previous run.
-        // The rootfs.ext4 can't be safely reused (dirty journal from SIGTERM/SIGKILL),
-        // but image layers are still cached in ImageStore so re-extraction is the only cost.
         let containerDir = imageStore.path
             .appendingPathComponent("containers")
             .appendingPathComponent(containerId)
-        if FileManager.default.fileExists(atPath: containerDir.path) {
-            debugLog("[ContainerEngine] Removing stale container directory for \(containerId)")
-            try? FileManager.default.removeItem(at: containerDir)
+        let hasExistingDir = FileManager.default.fileExists(atPath: containerDir.path)
+        // Invalidate cached rootfs if the image has changed (e.g. postgres:16-alpine → pgvector:pg16).
+        // We store the image reference in a .image-ref file alongside rootfs.ext4.
+        let imageRefFile = containerDir.appendingPathComponent(".image-ref")
+        if hasExistingDir {
+            let cachedRef = try? String(contentsOf: imageRefFile, encoding: .utf8)
+            if cachedRef != image {
+                debugLog("[ContainerEngine] Cached rootfs image mismatch for \(containerId): cached=\(cachedRef ?? "nil"), requested=\(image) — invalidating cache")
+                try? FileManager.default.removeItem(at: containerDir)
+            }
         }
+        let hasExistingRootfs = FileManager.default.fileExists(atPath: containerDir.path)
 
-        debugLog("[ContainerEngine] Creating container \(containerId) from \(image) with \(mounts.count) mount(s), command=\(command?.description ?? "nil"), rootfs=\(rootfsSizeInBytes / (1024*1024*1024))GiB")
+        debugLog("[ContainerEngine] Creating container \(containerId) from \(image) with \(mounts.count) mount(s), command=\(command?.description ?? "nil"), rootfs=\(rootfsSizeInBytes / (1024*1024*1024))GiB\(hasExistingRootfs ? " (reusing cached rootfs)" : "")")
 
         let stdoutWriter = DebugWriter(prefix: "\(containerId) stdout", onLine: onLog)
         let stderrWriter = DebugWriter(prefix: "\(containerId) stderr", onLine: onLog)
 
         // Poll rootfs disk usage during extraction to report progress.
         // The file is sparse, so allocated blocks / target size gives a rough %.
-        let progressPoller: Task<Void, Never>?
-        if let onPreparingProgress {
+        let startProgressPoller: () -> Task<Void, Never>? = {
+            guard let onPreparingProgress else { return nil }
             let targetBytes = estimatedContentBytes
             let containerDirPath = containerDir.path
-            progressPoller = Task.detached {
+            return Task.detached {
                 let fm = FileManager.default
                 var ext4CachedPath: String?
                 while !Task.isCancelled {
                     try? await Task.sleep(for: .milliseconds(500))
 
-                    // Find the rootfs ext4 file dynamically (cache path once found)
                     if ext4CachedPath == nil {
                         if let enumerator = fm.enumerator(atPath: containerDirPath) {
                             while let file = enumerator.nextObject() as? String {
@@ -360,45 +392,97 @@ actor ContainerEngine {
                     onPreparingProgress(progress)
                 }
             }
-        } else {
-            progressPoller = nil
         }
+        var progressPoller = startProgressPoller()
 
-        let container: LinuxContainer
-        do {
-            container = try await manager.create(
-                containerId,
-                reference: image,
-                rootfsSizeInBytes: rootfsSizeInBytes
-            ) { config in
-                config.cpus = 2
-                config.memoryInBytes = 1024 * 1024 * 1024
-                config.process.stdout = stdoutWriter
-                config.process.stderr = stderrWriter
+        var container: LinuxContainer
+        let rootfsFile = containerDir.appendingPathComponent("rootfs.ext4")
+        let hasExistingRootfsFile = hasExistingRootfs && FileManager.default.fileExists(atPath: rootfsFile.path)
 
-                if let command {
-                    config.process.arguments = command
-                }
-
-                for (key, value) in env {
-                    config.process.environmentVariables.append("\(key)=\(value)")
-                }
-
-                for mount in mounts {
-                    config.mounts.append(mount)
-                }
-            }
-        } catch {
+        if hasExistingRootfsFile {
+            // Reuse the cached rootfs from a previous clean shutdown.
+            // Wrap the entire lifecycle (create config → boot VM → start) so that
+            // any failure (corrupt ext4, mount EINVAL, etc.) falls back to a full re-extract.
             progressPoller?.cancel()
-            throw error
+            onPreparingProgress?(1.0)
+            do {
+                let rootfsMount = Mount.block(
+                    format: "ext4",
+                    source: rootfsFile.path,
+                    destination: "/",
+                    options: []
+                )
+                let ociImage = try await imageStore.get(reference: image, pull: false)
+                container = try await manager.create(
+                    containerId,
+                    image: ociImage,
+                    rootfs: rootfsMount
+                ) { config in
+                    config.cpus = 2
+                    config.memoryInBytes = 1024 * 1024 * 1024
+                    config.process.stdout = stdoutWriter
+                    config.process.stderr = stderrWriter
+                    if let command { config.process.arguments = command }
+                    for (key, value) in env { config.process.environmentVariables.append("\(key)=\(value)") }
+                    for mount in mounts { config.mounts.append(mount) }
+                }
+                try await container.create()
+                try await container.start()
+                debugLog("[ContainerEngine] Reused cached rootfs for \(containerId)")
+            } catch {
+                debugLog("[ContainerEngine] Cached rootfs unusable for \(containerId), re-extracting: \(error)")
+                try? manager.releaseNetwork(containerId)
+                try? FileManager.default.removeItem(at: containerDir)
+                // Restart progress reporting for the fresh extraction
+                onPreparingProgress?(0.0)
+                progressPoller = startProgressPoller()
+                container = try await manager.create(
+                    containerId, reference: image,
+                    rootfsSizeInBytes: rootfsSizeInBytes
+                ) { config in
+                    config.cpus = 2
+                    config.memoryInBytes = 1024 * 1024 * 1024
+                    config.process.stdout = stdoutWriter
+                    config.process.stderr = stderrWriter
+                    if let command { config.process.arguments = command }
+                    for (key, value) in env { config.process.environmentVariables.append("\(key)=\(value)") }
+                    for mount in mounts { config.mounts.append(mount) }
+                }
+                progressPoller?.cancel()
+                onPreparingProgress?(1.0)
+                try await container.create()
+                try await container.start()
+            }
+        } else {
+            // No cached rootfs — extract fresh from the image
+            if hasExistingRootfs {
+                try? FileManager.default.removeItem(at: containerDir)
+            }
+            do {
+                container = try await manager.create(
+                    containerId, reference: image,
+                    rootfsSizeInBytes: rootfsSizeInBytes
+                ) { config in
+                    config.cpus = 2
+                    config.memoryInBytes = 1024 * 1024 * 1024
+                    config.process.stdout = stdoutWriter
+                    config.process.stderr = stderrWriter
+                    if let command { config.process.arguments = command }
+                    for (key, value) in env { config.process.environmentVariables.append("\(key)=\(value)") }
+                    for mount in mounts { config.mounts.append(mount) }
+                }
+            } catch {
+                progressPoller?.cancel()
+                throw error
+            }
+            progressPoller?.cancel()
+            onPreparingProgress?(1.0)
+            try await container.create()
+            try await container.start()
         }
-        progressPoller?.cancel()
-        onPreparingProgress?(1.0)
 
-        debugLog("[ContainerEngine] Container \(containerId) created, calling create()...")
-        try await container.create()
-        debugLog("[ContainerEngine] Container \(containerId) VZ created, calling start()...")
-        try await container.start()
+        // Record which image was used so we can invalidate the cache on image changes.
+        try? image.write(to: imageRefFile, atomically: true, encoding: .utf8)
 
         let ip: String
         if let iface = container.interfaces.first {
@@ -409,13 +493,16 @@ actor ContainerEngine {
             debugLog("[ContainerEngine] Container \(containerId) started, NO interfaces, falling back to 127.0.0.1")
         }
 
-        // Monitor container exit in background to catch crashes
+        // Monitor container exit in background to catch crashes.
+        // Marks the container as exited so the health checker can detect it immediately.
         Task {
             do {
                 let status = try await container.wait()
                 debugLog("[ContainerEngine] Container \(containerId) EXITED with code \(status.exitCode)")
+                self.exitedContainers.insert(containerId)
             } catch {
                 debugLog("[ContainerEngine] Container \(containerId) wait error: \(error)")
+                self.exitedContainers.insert(containerId)
             }
         }
 
@@ -424,11 +511,13 @@ actor ContainerEngine {
     }
 
     /// Stops a container by service ID: SIGTERM, wait 10s, then SIGKILL.
-    func stopContainer(serviceId: String) async throws {
+    func stopContainer(serviceId: String, onLog: LogCallback? = nil) async throws {
         guard let containerId = serviceContainerMap[serviceId],
               let container = containers[containerId] else {
             return
         }
+
+        onLog?("Stopping \(serviceId)...")
 
         do {
             try await container.kill(SIGTERM)
@@ -436,34 +525,49 @@ actor ContainerEngine {
             // Container may have already exited
         }
 
-        // Wait up to 10 seconds for graceful shutdown, then force kill
-        let graceful = Task {
-            _ = try? await container.wait()
+        // Poll for container exit over 10 seconds (graceful shutdown window).
+        // The background exit monitor (started in createAndStartContainer)
+        // adds to exitedContainers when container.wait() completes.
+        var exited = exitedContainers.contains(containerId)
+        if !exited {
+            for _ in 0..<20 {
+                try? await Task.sleep(for: .milliseconds(500))
+                if exitedContainers.contains(containerId) {
+                    exited = true
+                    break
+                }
+            }
         }
 
-        let didFinish = await withTaskGroup(of: Bool.self) { group in
-            group.addTask {
-                _ = await graceful.result
-                return true
-            }
-            group.addTask {
-                try? await Task.sleep(for: .seconds(10))
-                return false
-            }
-            let first = await group.next() ?? false
-            group.cancelAll()
-            return first
-        }
-
-        if !didFinish {
+        if !exited {
+            onLog?("\(serviceId) did not stop within 10s, forcing...")
             try? await container.kill(SIGKILL)
-            _ = try? await container.wait()
+            // Brief wait for SIGKILL
+            for _ in 0..<6 {
+                try? await Task.sleep(for: .milliseconds(500))
+                if exitedContainers.contains(containerId) { break }
+            }
+        } else {
+            onLog?("\(serviceId) exited gracefully")
         }
 
-        try? await container.stop()
-        try? manager?.delete(containerId)
+        // Best-effort VM stop. The process is already dead (SIGTERM or SIGKILL above).
+        // Run in a detached task so we don't block if it hangs.
+        Task { try? await container.stop() }
+
+        // Release the network IP allocation but keep the container directory
+        // for rootfs reuse on next start.
+        try? manager?.releaseNetwork(containerId)
+        exitedContainers.remove(containerId)
         containers.removeValue(forKey: containerId)
         serviceContainerMap.removeValue(forKey: serviceId)
+        onLog?("\(serviceId) cleaned up")
+    }
+
+    /// Returns true if the container process for a service has exited unexpectedly.
+    func hasExited(serviceId: String) -> Bool {
+        guard let containerId = serviceContainerMap[serviceId] else { return false }
+        return exitedContainers.contains(containerId)
     }
 
     /// Runs a command inside a running container.
@@ -490,7 +594,7 @@ actor ContainerEngine {
     // MARK: - Dependency-Ordered Startup (Task 3.5)
 
     /// Callback for reporting status changes during startup.
-    typealias StatusCallback = @Sendable (String, ServiceStatus) -> Void
+    typealias StatusCallback = @Sendable (String, ServiceStatus, String?) -> Void
 
     /// Starts all services in dependency order, waiting for each to become healthy.
     /// Returns the updated services array. Calls `onStatus` when each service's status changes.
@@ -597,15 +701,19 @@ actor ContainerEngine {
     ) async throws -> (String, ServiceInfo) {
         var service = service
 
+        try Task.checkCancellation()
+
         service.status = .pulling
-        onStatus?(serviceId, .pulling)
+        onStatus?(serviceId, .pulling, nil)
 
         debugLog("[ContainerEngine] Pulling image for \(serviceId): \(imageName)")
         try await pullImage(name: imageName)
         debugLog("[ContainerEngine] Pull complete for \(serviceId)")
 
+        try Task.checkCancellation()
+
         service.status = .preparing
-        onStatus?(serviceId, .preparing)
+        onStatus?(serviceId, .preparing, nil)
 
         let env = buildEnv(for: serviceId, config: config, serviceIPs: serviceIPs)
         let mounts = try buildMountObjects(for: serviceId)
@@ -632,8 +740,10 @@ actor ContainerEngine {
             onPreparingProgress: progressCb
         )
 
+        try Task.checkCancellation()
+
         service.status = .starting
-        onStatus?(serviceId, .starting)
+        onStatus?(serviceId, .starting, nil)
         service.containerId = containerId
         service.containerIP = ip
         serviceContainerMap[serviceId] = containerId
@@ -642,7 +752,7 @@ actor ContainerEngine {
         if service.isEphemeral {
             guard let container = containers[containerId] else {
                 service.status = .error
-                onStatus?(serviceId, .error)
+                onStatus?(serviceId, .error, nil)
                 throw ContainerEngineError.healthCheckTimeout(serviceId)
             }
 
@@ -657,20 +767,27 @@ actor ContainerEngine {
 
             if exitStatus.exitCode == 0 {
                 service.status = .stopped
-                onStatus?(serviceId, .stopped)
+                onStatus?(serviceId, .stopped, nil)
             } else {
                 service.status = .error
-                onStatus?(serviceId, .error)
+                onStatus?(serviceId, .error, nil)
                 throw ContainerEngineError.migrationFailed(exitCode: Int(exitStatus.exitCode))
             }
         } else {
             let healthy = try await waitForHealthy(service: service, timeoutSeconds: 120)
             if healthy {
+                // Create extra databases that other services depend on
+                if serviceId == "postgres", let cid = service.containerId {
+                    await ensureDatabase("errand", containerId: cid)
+                    await ensureDatabase("litellm", containerId: cid)
+                    await ensureDatabase("hindsight", containerId: cid)
+                    await ensureExtension("vector", database: "hindsight", containerId: cid)
+                }
                 service.status = .running
-                onStatus?(serviceId, .running)
+                onStatus?(serviceId, .running, ip)
             } else {
                 service.status = .error
-                onStatus?(serviceId, .error)
+                onStatus?(serviceId, .error, nil)
                 throw ContainerEngineError.healthCheckTimeout(serviceId)
             }
         }
@@ -698,11 +815,11 @@ actor ContainerEngine {
         }
 
         service.status = .pulling
-        onStatus?(service.id, .pulling)
+        onStatus?(service.id, .pulling, nil)
         try await pullImage(name: imageName)
 
         service.status = .preparing
-        onStatus?(service.id, .preparing)
+        onStatus?(service.id, .preparing, nil)
 
         let env = buildEnv(for: service.id, config: config, serviceIPs: serviceIPs)
         let mounts = try buildMountObjects(for: service.id)
@@ -733,16 +850,21 @@ actor ContainerEngine {
         service.containerIP = ip
 
         service.status = .starting
-        onStatus?(service.id, .starting)
+        onStatus?(service.id, .starting, nil)
         serviceContainerMap[service.id] = containerId
 
         let healthy = try await waitForHealthy(service: service, timeoutSeconds: 120)
         if healthy {
+            if service.id == "postgres", let cid = service.containerId {
+                await ensureDatabase("litellm", containerId: cid)
+                await ensureDatabase("hindsight", containerId: cid)
+                await ensureExtension("vector", database: "hindsight", containerId: cid)
+            }
             service.status = .running
-            onStatus?(service.id, .running)
+            onStatus?(service.id, .running, ip)
         } else {
             service.status = .error
-            onStatus?(service.id, .error)
+            onStatus?(service.id, .error, nil)
             throw ContainerEngineError.healthCheckTimeout(service.id)
         }
 
@@ -752,24 +874,45 @@ actor ContainerEngine {
     // MARK: - Reverse-Order Shutdown (Task 3.6)
 
     /// Stops all services in reverse startup order.
-    /// Returns the updated services array.
-    func stopAll(services: [ServiceInfo]) async throws -> [ServiceInfo] {
+    /// Uses the engine's own serviceContainerMap (not the passed-in containerId)
+    /// so containers started mid-startup are properly stopped even if AppState
+    /// hasn't received the containerId yet.
+    /// Calls `onStatus` for each service as it transitions to stopping/stopped.
+    func stopAll(
+        services: [ServiceInfo],
+        onStatus: StatusCallback? = nil,
+        onLog: LogCallback? = nil
+    ) async throws -> [ServiceInfo] {
         var services = services
         let order = serviceShutdownOrder()
 
         for group in order {
             for serviceId in group {
                 guard let idx = services.firstIndex(where: { $0.id == serviceId }) else { continue }
-                guard services[idx].containerId != nil else { continue }
+                guard serviceContainerMap[serviceId] != nil else { continue }
 
                 services[idx].status = .stopping
-                try await stopContainer(serviceId: serviceId)
+                onStatus?(serviceId, .stopping, nil)
+                try await stopContainer(serviceId: serviceId, onLog: onLog)
                 services[idx].status = .stopped
                 services[idx].containerId = nil
                 services[idx].containerIP = nil
                 services[idx].healthCheckFailures = 0
+                onStatus?(serviceId, .stopped, nil)
             }
         }
+
+        // Reset any services stuck in intermediate states (e.g. pulling/preparing
+        // from a cancelled startup) that had no container to stop.
+        for idx in services.indices {
+            if services[idx].status != .stopped {
+                services[idx].status = .stopped
+                services[idx].containerId = nil
+                services[idx].containerIP = nil
+                onStatus?(services[idx].id, .stopped, nil)
+            }
+        }
+
         return services
     }
 
@@ -781,7 +924,9 @@ actor ContainerEngine {
         try await ensureInitialized()
         guard var manager else { throw ContainerEngineError.notInitialized }
 
-        try await pullImage(name: image)
+        let qualifiedImage = Self.qualifyImageReference(image)
+        debugLog("[BridgeServer] createTaskContainer image=\(image) → \(qualifiedImage)")
+        try await pullImage(name: qualifiedImage)
 
         let containerId = "task-\(UUID().uuidString.prefix(8).lowercased())"
 
@@ -801,7 +946,7 @@ actor ContainerEngine {
 
         let container = try await manager.create(
             containerId,
-            reference: image,
+            reference: qualifiedImage,
             rootfsSizeInBytes: 2 * 1024 * 1024 * 1024
         ) { config in
             config.cpus = 1
@@ -942,7 +1087,7 @@ actor ContainerEngine {
         for service in services {
             switch service.id {
             case "postgres":
-                images["postgres"] = "docker.io/library/postgres:16-alpine"
+                images["postgres"] = "docker.io/pgvector/pgvector:pg16"
             case "valkey":
                 images["valkey"] = "docker.io/valkey/valkey:8-alpine"
             case "backend", "worker", "migrate":
@@ -950,7 +1095,7 @@ actor ContainerEngine {
             case "litellm":
                 images["litellm"] = "ghcr.io/berriai/litellm-database:main-v1.81.3-stable"
             case "hindsight":
-                images["hindsight"] = "ghcr.io/vectorize-io/hindsight:0.4.13"
+                images["hindsight"] = "ghcr.io/vectorize-io/hindsight:0.4.13-slim"
             default:
                 break
             }
@@ -970,7 +1115,7 @@ actor ContainerEngine {
         case "postgres":
             env["POSTGRES_USER"] = "postgres"
             env["POSTGRES_PASSWORD"] = "postgres"
-            env["POSTGRES_DB"] = "content_manager"
+            env["POSTGRES_DB"] = "errand"
             env["PGDATA"] = "/var/lib/postgresql/data/pgdata"
 
         case "valkey":
@@ -978,12 +1123,12 @@ actor ContainerEngine {
 
         case "migrate":
             if let pgIP = serviceIPs["postgres"] {
-                env["DATABASE_URL"] = "postgresql://postgres:postgres@\(pgIP):5432/content_manager"
+                env["DATABASE_URL"] = "postgresql://postgres:postgres@\(pgIP):5432/errand"
             }
 
         case "backend":
             if let pgIP = serviceIPs["postgres"] {
-                env["DATABASE_URL"] = "postgresql://postgres:postgres@\(pgIP):5432/content_manager"
+                env["DATABASE_URL"] = "postgresql://postgres:postgres@\(pgIP):5432/errand"
             }
             if let vkIP = serviceIPs["valkey"] {
                 env["VALKEY_URL"] = "redis://\(vkIP):6379"
@@ -1005,7 +1150,7 @@ actor ContainerEngine {
 
         case "worker":
             if let pgIP = serviceIPs["postgres"] {
-                env["DATABASE_URL"] = "postgresql://postgres:postgres@\(pgIP):5432/content_manager"
+                env["DATABASE_URL"] = "postgresql://postgres:postgres@\(pgIP):5432/errand"
             }
             if let vkIP = serviceIPs["valkey"] {
                 env["VALKEY_URL"] = "redis://\(vkIP):6379"
@@ -1029,8 +1174,9 @@ actor ContainerEngine {
             }
             // Bridge API credentials so the worker can create task-runner containers
             env["CONTAINER_RUNTIME"] = "apple"
-            env["CONTAINER_BRIDGE_URL"] = "http://host.containers.internal:\(bridgePort)"
+            env["CONTAINER_BRIDGE_URL"] = "http://\(hostGatewayIP):\(bridgePort)"
             env["CONTAINER_BRIDGE_TOKEN"] = bridgeToken
+            env["TASK_RUNNER_IMAGE"] = "ghcr.io/errand-ai/errand-task-runner:\(config.contentManagerImageTag)"
 
         case "litellm":
             env["HOST"] = "0.0.0.0"
@@ -1045,6 +1191,8 @@ actor ContainerEngine {
             if !litellmMasterKey.isEmpty {
                 env["PROXY_MASTER_KEY"] = litellmMasterKey
                 env["LITELLM_MASTER_KEY"] = litellmMasterKey
+                env["UI_USERNAME"] = "admin"
+                env["UI_PASSWORD"] = litellmMasterKey
             }
             env["LITELLM_MODE"] = "PRODUCTION"
             env["LITELLM_PROXY_CONNECTION_TIMEOUT"] = "600"
@@ -1054,26 +1202,39 @@ actor ContainerEngine {
                 env["HINDSIGHT_API_DATABASE_URL"] = "postgresql://postgres:postgres@\(pgIP):5432/hindsight"
             }
             env["HINDSIGHT_API_PORT"] = "8888"
-            // Hindsight accepts "openai" as provider — LiteLLM exposes an OpenAI-compatible API
+            env["HINDSIGHT_API_HOST"] = "0.0.0.0"
+            env["HINDSIGHT_CP_HOSTNAME"] = "0.0.0.0"
+            // Use 127.0.0.1 instead of localhost — the container VM has no /etc/hosts
+            env["HINDSIGHT_CP_DATAPLANE_API_URL"] = "http://127.0.0.1:8888"
+            // LLM: "openai" provider — LiteLLM exposes an OpenAI-compatible API
             env["HINDSIGHT_API_LLM_PROVIDER"] = "openai"
-            env["HINDSIGHT_API_EMBEDDING_PROVIDER"] = "openai"
+            // Embeddings: "litellm" provider — slim image has no local embedding models
+            env["HINDSIGHT_API_EMBEDDINGS_PROVIDER"] = "litellm"
+            // Reranker: "litellm" provider — slim image has no local reranker models
+            env["HINDSIGHT_API_RERANKER_PROVIDER"] = "litellm"
+            env["HINDSIGHT_API_RERANKER_LITELLM_MODEL"] = "cohere/rerank-english-v3.0"
             if let litellmIP = serviceIPs["litellm"] {
-                let llmBase = "http://\(litellmIP):\(config.litellmPort)/v1"
-                env["HINDSIGHT_API_LLM_BASE_URL"] = llmBase
+                let litellmBase = "http://\(litellmIP):\(config.litellmPort)"
+                // LLM uses OpenAI-compatible /v1 endpoint
+                env["HINDSIGHT_API_LLM_BASE_URL"] = "\(litellmBase)/v1"
                 env["HINDSIGHT_API_LLM_API_KEY"] = litellmMasterKey
-                env["HINDSIGHT_API_EMBEDDING_BASE_URL"] = llmBase
-                env["HINDSIGHT_API_EMBEDDING_API_KEY"] = litellmMasterKey
+                // LiteLLM proxy base for embeddings and reranker (no /v1 suffix)
+                env["HINDSIGHT_API_LITELLM_API_BASE"] = litellmBase
+                env["HINDSIGHT_API_EMBEDDINGS_LITELLM_API_BASE"] = litellmBase
+                env["HINDSIGHT_API_EMBEDDINGS_LITELLM_API_KEY"] = litellmMasterKey
             } else if !config.openaiBaseURL.isEmpty {
                 env["HINDSIGHT_API_LLM_BASE_URL"] = config.openaiBaseURL
                 env["HINDSIGHT_API_LLM_API_KEY"] = config.openaiAPIKey
-                env["HINDSIGHT_API_EMBEDDING_BASE_URL"] = config.openaiBaseURL
-                env["HINDSIGHT_API_EMBEDDING_API_KEY"] = config.openaiAPIKey
+                // Fall back to OpenAI embeddings when no LiteLLM
+                env["HINDSIGHT_API_EMBEDDINGS_PROVIDER"] = "openai"
+                env["HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL"] = config.openaiBaseURL
+                env["HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY"] = config.openaiAPIKey
             }
             if !config.hindsightLLMModel.isEmpty {
                 env["HINDSIGHT_API_LLM_MODEL"] = config.hindsightLLMModel
             }
             if !config.hindsightEmbeddingModel.isEmpty {
-                env["HINDSIGHT_API_EMBEDDING_LITELLM_MODEL"] = config.hindsightEmbeddingModel
+                env["HINDSIGHT_API_EMBEDDINGS_LITELLM_MODEL"] = config.hindsightEmbeddingModel
             }
 
         default:
@@ -1193,6 +1354,45 @@ actor ContainerEngine {
     }
 
     /// Runs a command inside the container and returns true if exit code is 0.
+    /// Creates a database in Postgres if it doesn't already exist.
+    /// Uses a single shell command to check and create atomically, avoiding
+    /// noisy ERROR logs in the postgres server output.
+    private func ensureDatabase(_ name: String, containerId: String) async {
+        // psql -tAc outputs just "1" if the DB exists; grep -q exits 0 on match.
+        // If the DB doesn't exist, createdb creates it.
+        let script = "psql -U postgres -tAc \"SELECT 1 FROM pg_database WHERE datname = '\(name)'\" | grep -q 1 || createdb -U postgres \(name)"
+        do {
+            let (exitCode, _, stderr) = try await execInContainer(
+                containerId: containerId,
+                command: ["sh", "-c", script]
+            )
+            if exitCode == 0 {
+                debugLog("[ContainerEngine] Database '\(name)' ensured")
+            } else {
+                debugLog("[ContainerEngine] Failed to ensure database '\(name)': \(stderr)")
+            }
+        } catch {
+            debugLog("[ContainerEngine] Failed to ensure database '\(name)': \(error)")
+        }
+    }
+
+    private func ensureExtension(_ ext: String, database: String, containerId: String) async {
+        let sql = "CREATE EXTENSION IF NOT EXISTS \(ext)"
+        do {
+            let (exitCode, _, stderr) = try await execInContainer(
+                containerId: containerId,
+                command: ["psql", "-U", "postgres", "-d", database, "-c", sql]
+            )
+            if exitCode == 0 {
+                debugLog("[ContainerEngine] Extension '\(ext)' ensured in '\(database)'")
+            } else {
+                debugLog("[ContainerEngine] Failed to create extension '\(ext)' in '\(database)': \(stderr)")
+            }
+        } catch {
+            debugLog("[ContainerEngine] Failed to ensure extension '\(ext)' in '\(database)': \(error)")
+        }
+    }
+
     private func execHealthCheck(containerId: String, command: [String]) async -> Bool {
         do {
             let (exitCode, _, _) = try await execInContainer(containerId: containerId, command: command)
