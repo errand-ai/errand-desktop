@@ -67,7 +67,12 @@ struct MenuBarPopover: View {
                         .frame(width: 8, height: 8)
                     Text(service.displayName)
                     Spacer()
-                    if service.status != .stopped && service.status != .running {
+                    if service.status == .preparing, let progress = service.preparingProgress {
+                        Text("Preparing \(Int(progress * 100))%")
+                            .font(.caption)
+                            .foregroundStyle(service.status.color)
+                            .monospacedDigit()
+                    } else if service.status != .stopped && service.status != .running {
                         Text(service.status.label)
                             .font(.caption)
                             .foregroundStyle(service.status.color)
@@ -89,16 +94,9 @@ struct MenuBarPopover: View {
         VStack(spacing: 6) {
             HStack(spacing: 8) {
                 Button("Start All") {
-                    Task {
-                        do {
-                            try await appState.startAll()
-                        } catch {
-                            appState.appendLog(service: "app", message: "Start failed: \(error)")
-                            print("[StartAll] Error: \(error)")
-                        }
-                    }
+                    appState.startAllInBackground()
                 }
-                .disabled(appState.services.allSatisfy { $0.status == .running })
+                .disabled(appState.appStatus != .idle)
 
                 Button("Stop All") {
                     Task {
@@ -158,7 +156,7 @@ extension ServiceStatus {
     var color: Color {
         switch self {
         case .running: .green
-        case .pulling: .blue
+        case .pulling, .preparing: .blue
         case .starting, .stopping: .orange
         case .error: .red
         case .stopped: .gray
@@ -169,6 +167,7 @@ extension ServiceStatus {
         switch self {
         case .stopped: "Stopped"
         case .pulling: "Pulling..."
+        case .preparing: "Preparing..."
         case .starting: "Starting..."
         case .running: "Running"
         case .stopping: "Stopping..."

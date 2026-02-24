@@ -16,6 +16,16 @@ enum KeychainManager {
         return key
     }
 
+    /// Retrieves the LiteLLM master key, or creates one in `sk-<18 alphanumeric>` format.
+    static func getOrCreateLiteLLMKey() throws -> String {
+        if let existing = try get(account: "litellm-master-key") {
+            return existing
+        }
+        let key = generateLiteLLMKey()
+        try set(account: "litellm-master-key", value: key)
+        return key
+    }
+
     /// Retrieves a Keychain item by account name. Returns nil if not found.
     static func get(account: String) throws -> String? {
         let query: [String: Any] = [
@@ -86,6 +96,15 @@ enum KeychainManager {
         var bytes = [UInt8](repeating: 0, count: bytesCount)
         _ = SecRandomCopyBytes(kSecRandomDefault, bytesCount, &bytes)
         return Data(bytes).base64EncodedString()
+    }
+
+    /// Generates a LiteLLM-compatible API key in the format `sk-<18 alphanumeric chars>`.
+    static func generateLiteLLMKey() -> String {
+        let chars = Array("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+        var bytes = [UInt8](repeating: 0, count: 18)
+        _ = SecRandomCopyBytes(kSecRandomDefault, 18, &bytes)
+        let suffix = String(bytes.map { chars[Int($0) % chars.count] })
+        return "sk-\(suffix)"
     }
 }
 

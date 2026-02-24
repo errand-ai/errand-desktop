@@ -6,8 +6,17 @@ struct SetupAssistantView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var step = 0
     @State private var isPulling = false
+    @State private var isStartingSetupServices = false
+    @State private var setupServiceError: String?
+    @State private var chatModels: [AppState.ModelInfo] = []
+    @State private var embeddingModels: [AppState.ModelInfo] = []
+    @State private var isLoadingModels = false
+    @State private var modelFetchError = false
+    @State private var availableTags: [String] = []
+    @State private var isLoadingTags = false
+    @State private var tagFetchError = false
 
-    private let totalSteps = 5
+    private let totalSteps = 6
 
     var body: some View {
         VStack(spacing: 0) {
@@ -26,9 +35,10 @@ struct SetupAssistantView: View {
                 switch step {
                 case 0: welcomeStep
                 case 1: llmStep
-                case 2: litellmStep
-                case 3: imagePullStep
-                case 4: doneStep
+                case 2: agentMemoryStep
+                case 3: versionStep
+                case 4: imagePullStep
+                case 5: doneStep
                 default: EmptyView()
                 }
             }
@@ -41,7 +51,7 @@ struct SetupAssistantView: View {
             HStack {
                 if step > 0 && step < totalSteps - 1 {
                     Button("Back") { step -= 1 }
-                        .disabled(isPulling)
+                        .disabled(isPulling || isStartingSetupServices)
                 }
 
                 Spacer()
@@ -49,7 +59,7 @@ struct SetupAssistantView: View {
                 if step < totalSteps - 1 {
                     Button("Continue") { step += 1 }
                         .keyboardShortcut(.defaultAction)
-                        .disabled(step == 3 && isPulling)
+                        .disabled(isPulling || isStartingSetupServices)
                 } else {
                     Button("Finish") {
                         appState.completeFirstRun()
@@ -60,7 +70,7 @@ struct SetupAssistantView: View {
             }
             .padding(16)
         }
-        .frame(width: 500, height: 420)
+        .frame(width: 500, height: 480)
         .onAppear {
             // Menu bar apps (LSUIElement) can't receive keyboard focus by default.
             // Temporarily become a regular app so the window can accept key input.
@@ -93,7 +103,7 @@ struct SetupAssistantView: View {
             Text("Welcome to Errand Desktop")
                 .font(.title2.weight(.semibold))
 
-            Text("This app runs the Content Manager stack locally using lightweight Linux containers on your Mac.\n\nLet's configure a few things to get started.")
+            Text("This app runs the Errand AI stack locally using lightweight Linux containers on your Mac.\n\nLet's configure a few things to get started.")
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
         }
@@ -104,33 +114,316 @@ struct SetupAssistantView: View {
             Text("LLM Configuration")
                 .font(.title2.weight(.semibold))
 
-            Text("Enter your OpenAI-compatible API credentials.")
-                .foregroundStyle(.secondary)
+            Toggle("Use LiteLLM", isOn: $appState.config.useLiteLLM)
+
+            if appState.config.useLiteLLM {
+                // Inline container startup progress
+                if isStartingSetupServices {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Starting services...")
+                            .foregroundStyle(.secondary)
+                        ForEach(["postgres", "litellm"], id: \.self) { serviceId in
+                            if let service = appState.services.first(where: { $0.id == serviceId }) {
+                                HStack {
+                                    Text(service.displayName)
+                                        .frame(width: 90, alignment: .leading)
+                                    switch service.status {
+                                    case .pulling:
+                                        ProgressView()
+                                            .controlSize(.small)
+                                        Text("Pulling image...")
+                                            .foregroundStyle(.secondary)
+                                    case .preparing:
+                                        if let progress = service.preparingProgress {
+                                            ProgressView(value: progress)
+                                                .frame(width: 60)
+                                            Text("\(Int(progress * 100))%")
+                                                .foregroundStyle(.secondary)
+                                                .monospacedDigit()
+                                        } else {
+                                            ProgressView()
+                                                .controlSize(.small)
+                                            Text("Preparing...")
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    case .starting:
+                                        ProgressView()
+                                            .controlSize(.small)
+                                        Text("Starting...")
+                                            .foregroundStyle(.secondary)
+                                    case .running:
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .foregroundStyle(.green)
+                                        Text("Running")
+                                            .foregroundStyle(.secondary)
+                                    case .error:
+                                        Image(systemName: "xmark.circle.fill")
+                                            .foregroundStyle(.red)
+                                        Text("Error")
+                                            .foregroundStyle(.red)
+                                    default:
+                                        Text("Waiting...")
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let error = setupServiceError {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(error)
+                            .foregroundStyle(.red)
+                            .font(.caption)
+                        Button("Retry") {
+                            startLiteLLMServices()
+                        }
+                    }
+                }
+
+                let litellmRunning = appState.services.first(where: { $0.id == "litellm" })?.status == .running
+
+                if litellmRunning {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Button("Open LiteLLM UI") {
+                            if let url = URL(string: "http://localhost:\(appState.config.litellmPort)/ui") {
+                                NSWorkspace.shared.open(url)
+                            }
+                        }
+
+                        if let masterKey = try? KeychainManager.getOrCreateLiteLLMKey() {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Login credentials:")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                HStack(spacing: 4) {
+                                    Text("Username:")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    Text("admin")
+                                        .font(.caption.monospaced())
+                                        .textSelection(.enabled)
+                                }
+                                HStack(spacing: 4) {
+                                    Text("Password:")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    Text(masterKey)
+                                        .font(.caption.monospaced())
+                                        .textSelection(.enabled)
+                                }
+                            }
+                        }
+                    }
+                } else if !isStartingSetupServices && setupServiceError == nil {
+                    Button("Open LiteLLM UI") {}
+                        .disabled(true)
+                }
+            }
+
+            if !appState.config.useLiteLLM {
+                Text("Enter your OpenAI-compatible API credentials.")
+                    .foregroundStyle(.secondary)
+            }
 
             Form {
                 LabeledContent("Base URL") {
-                    TextField("https://api.openai.com/v1", text: $appState.config.openaiBaseURL)
+                    TextField("", text: $appState.config.openaiBaseURL, prompt: Text("https://api.openai.com/v1"))
                         .frame(width: 250)
+                        .disabled(appState.config.useLiteLLM)
                 }
 
                 LabeledContent("API Key") {
-                    SecureField("sk-...", text: $appState.config.openaiAPIKey)
+                    SecureField("", text: $appState.config.openaiAPIKey, prompt: Text("sk-...."))
                         .frame(width: 250)
+                        .disabled(appState.config.useLiteLLM)
                 }
             }
+            .opacity(appState.config.useLiteLLM ? 0.5 : 1.0)
+        }
+        .task(id: appState.config.useLiteLLM) {
+            guard appState.config.useLiteLLM else { return }
+            let litellmRunning = appState.services.first(where: { $0.id == "litellm" })?.status == .running
+            guard !litellmRunning && !isStartingSetupServices else { return }
+            startLiteLLMServices()
         }
     }
 
-    private var litellmStep: some View {
+    private func startLiteLLMServices() {
+        setupServiceError = nil
+        isStartingSetupServices = true
+        Task {
+            do {
+                try await appState.startSetupServices()
+            } catch {
+                setupServiceError = "Failed to start services: \(error.localizedDescription)"
+            }
+            isStartingSetupServices = false
+        }
+    }
+
+    private var agentMemoryStep: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("LiteLLM Proxy")
+            Text("Agent Memory")
                 .font(.title2.weight(.semibold))
 
-            Text("LiteLLM provides a unified API proxy for multiple LLM providers. Enable it if you want to use models from different providers.")
+            Toggle("Use Hindsight for Agent Memory", isOn: $appState.config.useHindsight)
+
+            if appState.config.useHindsight {
+                if isLoadingModels {
+                    HStack {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Loading available models...")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if modelFetchError {
+                    HStack {
+                        Text("Failed to load models.")
+                            .foregroundStyle(.red)
+                            .font(.caption)
+                        Button("Retry") {
+                            fetchModels()
+                        }
+                    }
+                }
+            }
+
+            Form {
+                LabeledContent("LLM Model") {
+                    Picker("", selection: $appState.config.hindsightLLMModel) {
+                        Text("Select a model").tag("")
+                        ForEach(chatModels) { model in
+                            Text(model.id).tag(model.id)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 250)
+                    .disabled(!appState.config.useHindsight)
+                }
+
+                LabeledContent("Embedding Model") {
+                    Picker("", selection: $appState.config.hindsightEmbeddingModel) {
+                        Text("Select a model").tag("")
+                        ForEach(embeddingModels) { model in
+                            Text(model.id).tag(model.id)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 250)
+                    .disabled(!appState.config.useHindsight)
+                }
+            }
+            .opacity(appState.config.useHindsight ? 1.0 : 0.5)
+        }
+        .task(id: appState.config.useHindsight) {
+            guard appState.config.useHindsight else { return }
+            fetchModels()
+        }
+    }
+
+    private func fetchModels() {
+        isLoadingModels = true
+        modelFetchError = false
+        Task {
+            let (chat, embedding) = await appState.fetchAvailableModels()
+            chatModels = chat
+            embeddingModels = embedding
+            modelFetchError = chat.isEmpty && embedding.isEmpty
+
+            // Auto-select claude-sonnet if available
+            if appState.config.hindsightLLMModel.isEmpty,
+               let sonnet = chat.first(where: { $0.id.hasPrefix("claude-sonnet") }) {
+                appState.config.hindsightLLMModel = sonnet.id
+            }
+
+            isLoadingModels = false
+        }
+    }
+
+    private var versionStep: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Image Version")
+                .font(.title2.weight(.semibold))
+
+            Text("Select which version of the Errand stack to install.")
                 .foregroundStyle(.secondary)
 
-            Toggle("Enable LiteLLM", isOn: $appState.config.litellmEnabled)
-                .padding(.top, 8)
+            if isLoadingTags {
+                HStack {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Fetching available versions...")
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if tagFetchError {
+                HStack {
+                    Text("Failed to fetch versions.")
+                        .foregroundStyle(.red)
+                        .font(.caption)
+                    Button("Retry") {
+                        fetchTags()
+                    }
+                }
+            }
+
+            Form {
+                LabeledContent("Version") {
+                    Picker("", selection: $appState.config.contentManagerImageTag) {
+                        if !availableTags.contains(appState.config.contentManagerImageTag) && !appState.config.contentManagerImageTag.isEmpty {
+                            Text(appState.config.contentManagerImageTag)
+                                .tag(appState.config.contentManagerImageTag)
+                        }
+                        ForEach(availableTags, id: \.self) { tag in
+                            Text(tag).tag(tag)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 250)
+                    .disabled(availableTags.isEmpty)
+                }
+
+                Toggle("Show beta versions", isOn: $appState.config.showBetaVersions)
+                    .onChange(of: appState.config.showBetaVersions) {
+                        fetchTags()
+                    }
+            }
+        }
+        .task {
+            guard availableTags.isEmpty else { return }
+            fetchTags()
+        }
+    }
+
+    private func fetchTags() {
+        isLoadingTags = true
+        tagFetchError = false
+        Task {
+            do {
+                var tags = try await GHCRTagFetcher.fetchTags(
+                    image: "errand-ai/errand",
+                    includeBeta: appState.config.showBetaVersions
+                )
+                // Remove "latest" unless it's an actual tag returned from GHCR
+                // (GHCRTagFetcher already filters and sorts by semver descending)
+                tags = tags.filter { $0 != "latest" }
+                availableTags = tags
+
+                // Auto-select the highest semver version (first in the sorted list)
+                if let first = tags.first,
+                   appState.config.contentManagerImageTag == "latest" || !tags.contains(appState.config.contentManagerImageTag) {
+                    appState.config.contentManagerImageTag = first
+                }
+            } catch {
+                tagFetchError = true
+                appState.appendLog(service: "system", message: "Failed to fetch image tags: \(error.localizedDescription)")
+            }
+            isLoadingTags = false
         }
     }
 

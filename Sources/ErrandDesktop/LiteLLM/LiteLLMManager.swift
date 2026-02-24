@@ -138,7 +138,7 @@ actor LiteLLMManager {
     /// When LiteLLM is enabled and running, routes through the proxy.
     /// Otherwise falls back to the direct URL from config.
     func resolveOpenAIBaseURL(config: AppConfig) -> String {
-        if config.litellmEnabled, let proxy = proxyBaseURL(port: config.litellmPort) {
+        if let proxy = proxyBaseURL(port: config.litellmPort) {
             return proxy
         }
         return config.openaiBaseURL

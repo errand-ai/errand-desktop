@@ -78,6 +78,7 @@ private struct LogEntryRow: View {
         "backend": .green,
         "worker": .orange,
         "litellm": .cyan,
+        "hindsight": .mint,
     ]
 
     var body: some View {

@@ -28,13 +28,32 @@ class StorageManager {
 
     /// Creates the data directories for container volumes.
     func ensureDataDirectories() {
-        let subdirs = ["litellm"]
+        let subdirs = ["litellm", "hindsight"]
         for sub in subdirs {
             let dir = dataDir.appendingPathComponent(sub)
             try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
         }
         // Also ensure the disks directory exists
         try? fm.createDirectory(at: dataDir.appendingPathComponent("disks"), withIntermediateDirectories: true)
+
+        // Write default LiteLLM config if not present
+        let litellmConfig = dataDir.appendingPathComponent("litellm/config.yaml")
+        if !fm.fileExists(atPath: litellmConfig.path) {
+            let defaultConfig = """
+            general_settings:
+              store_model_in_db: true
+              store_prompts_in_spend_logs: true
+              master_key: os.environ/PROXY_MASTER_KEY
+              database_connection_pool_limits: 10
+              allow_requests_on_db_unavailable: True
+
+            litellm_settings:
+              request_timeout: 600
+              set_verbose: False
+              json_logs: false
+            """
+            try? defaultConfig.write(to: litellmConfig, atomically: true, encoding: .utf8)
+        }
     }
 
     /// Returns the host path for a service's data volume (virtiofs shares).

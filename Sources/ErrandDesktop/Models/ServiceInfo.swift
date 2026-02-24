@@ -4,6 +4,7 @@ import Foundation
 enum ServiceStatus: String, Sendable {
     case stopped
     case pulling      // Downloading container image
+    case preparing    // Extracting rootfs from image layers
     case starting     // Container created, waiting for healthy
     case running
     case stopping
@@ -23,17 +24,49 @@ struct ServiceInfo: Identifiable, Sendable {
     let id: String          // e.g. "postgres", "valkey", "backend", "worker", "litellm", "migrate"
     let displayName: String // e.g. "PostgreSQL", "Valkey", "Backend", "Worker", "LiteLLM", "Migrate"
     var status: ServiceStatus = .stopped
-    var port: Int?
+    var port: Int?          // localhost port for forwarding
+    var containerPort: Int? // container-internal port, if different from `port`
     var containerId: String?
     var containerIP: String?
     var healthCheckFailures: Int = 0
     var isEphemeral: Bool = false
+    var preparingProgress: Double?  // 0.0–1.0 during rootfs extraction
 }
 
-/// Startup order for services. Each group starts after the previous group is healthy.
-let serviceStartupOrder: [[String]] = [
-    ["postgres"],
-    ["migrate", "valkey"],
-    ["backend"],
-    ["worker"],
+/// Dependency graph for service startup. Each key depends on the listed services being healthy first.
+/// Services with no dependencies (empty array) start immediately and in parallel.
+let serviceDependencies: [String: [String]] = [
+    "postgres": [],
+    "valkey": [],
+    "migrate": ["postgres"],
+    "litellm": ["postgres"],
+    "hindsight": ["litellm"],
+    "backend": ["migrate"],
+    "worker": ["backend"],
 ]
+
+/// Computes a reverse-topological shutdown order from the dependency graph.
+/// Services that depend on others are stopped first.
+func serviceShutdownOrder() -> [[String]] {
+    // Topological sort into levels by depth
+    var depths: [String: Int] = [:]
+
+    func depth(of id: String) -> Int {
+        if let cached = depths[id] { return cached }
+        let deps = serviceDependencies[id] ?? []
+        let d = deps.isEmpty ? 0 : (deps.map { depth(of: $0) }.max()! + 1)
+        depths[id] = d
+        return d
+    }
+
+    for id in serviceDependencies.keys { _ = depth(of: id) }
+
+    // Group by depth, then reverse so deepest (most dependent) stops first
+    let maxDepth = depths.values.max() ?? 0
+    var groups: [[String]] = []
+    for d in stride(from: maxDepth, through: 0, by: -1) {
+        let group = depths.filter { $0.value == d }.map(\.key)
+        if !group.isEmpty { groups.append(group) }
+    }
+    return groups
+}

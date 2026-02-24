@@ -1,7 +1,7 @@
 import SwiftUI
 import ServiceManagement
 
-/// Settings window for API keys, OIDC config, LiteLLM toggle, ports.
+/// Settings window for API keys, memory model config, and ports.
 struct SettingsView: View {
     @EnvironmentObject var appState: AppState
 
@@ -13,9 +13,9 @@ struct SettingsView: View {
             LLMTab()
                 .environmentObject(appState)
                 .tabItem { Label("LLM", systemImage: "brain") }
-            OIDCTab()
+            MemoryTab()
                 .environmentObject(appState)
-                .tabItem { Label("OIDC", systemImage: "lock.shield") }
+                .tabItem { Label("Memory", systemImage: "brain.head.profile") }
             PortsTab()
                 .environmentObject(appState)
                 .tabItem { Label("Ports", systemImage: "network") }
@@ -125,19 +125,21 @@ private struct LLMTab: View {
 
     var body: some View {
         Form {
+            Toggle("Use LiteLLM", isOn: $appState.config.useLiteLLM)
+
             LabeledContent("Base URL") {
-                TextField("https://api.openai.com/v1", text: $appState.config.openaiBaseURL)
+                TextField("", text: $appState.config.openaiBaseURL, prompt: Text("https://api.openai.com/v1"))
                     .frame(width: 250)
+                    .disabled(appState.config.useLiteLLM)
             }
+            .opacity(appState.config.useLiteLLM ? 0.5 : 1.0)
 
             LabeledContent("API Key") {
-                SecureField("sk-...", text: $appState.config.openaiAPIKey)
+                SecureField("", text: $appState.config.openaiAPIKey, prompt: Text("sk-...."))
                     .frame(width: 250)
+                    .disabled(appState.config.useLiteLLM)
             }
-
-            Divider()
-
-            Toggle("Enable LiteLLM Proxy", isOn: $appState.config.litellmEnabled)
+            .opacity(appState.config.useLiteLLM ? 0.5 : 1.0)
 
             HStack {
                 Spacer()
@@ -148,26 +150,60 @@ private struct LLMTab: View {
     }
 }
 
-// MARK: - OIDC
+// MARK: - Memory
 
-private struct OIDCTab: View {
+private struct MemoryTab: View {
     @EnvironmentObject var appState: AppState
+    @State private var chatModels: [AppState.ModelInfo] = []
+    @State private var embeddingModels: [AppState.ModelInfo] = []
+    @State private var isLoadingModels = false
 
     var body: some View {
         Form {
-            LabeledContent("Discovery URL") {
-                TextField("https://...", text: $appState.config.oidcDiscoveryURL)
-                    .frame(width: 250)
-            }
+            Toggle("Use Hindsight for Agent Memory", isOn: $appState.config.useHindsight)
 
-            LabeledContent("Client ID") {
-                TextField("Client ID", text: $appState.config.oidcClientID)
-                    .frame(width: 250)
+            LabeledContent("LLM Model") {
+                Picker("", selection: $appState.config.hindsightLLMModel) {
+                    Text("Select a model").tag("")
+                    ForEach(chatModels) { model in
+                        Text(model.id).tag(model.id)
+                    }
+                    // Keep current value visible even if not yet in fetched list
+                    if !appState.config.hindsightLLMModel.isEmpty,
+                       !chatModels.contains(where: { $0.id == appState.config.hindsightLLMModel }) {
+                        Text(appState.config.hindsightLLMModel).tag(appState.config.hindsightLLMModel)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 250)
+                .disabled(!appState.config.useHindsight)
             }
+            .opacity(appState.config.useHindsight ? 1.0 : 0.5)
 
-            LabeledContent("Client Secret") {
-                SecureField("Secret", text: $appState.config.oidcClientSecret)
-                    .frame(width: 250)
+            LabeledContent("Embedding Model") {
+                Picker("", selection: $appState.config.hindsightEmbeddingModel) {
+                    Text("Select a model").tag("")
+                    ForEach(embeddingModels) { model in
+                        Text(model.id).tag(model.id)
+                    }
+                    if !appState.config.hindsightEmbeddingModel.isEmpty,
+                       !embeddingModels.contains(where: { $0.id == appState.config.hindsightEmbeddingModel }) {
+                        Text(appState.config.hindsightEmbeddingModel).tag(appState.config.hindsightEmbeddingModel)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 250)
+                .disabled(!appState.config.useHindsight)
+            }
+            .opacity(appState.config.useHindsight ? 1.0 : 0.5)
+
+            if isLoadingModels {
+                HStack {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Loading models...")
+                        .foregroundStyle(.secondary)
+                }
             }
 
             HStack {
@@ -176,6 +212,23 @@ private struct OIDCTab: View {
             }
         }
         .padding()
+        .task {
+            guard appState.config.useHindsight else { return }
+            await loadModels()
+        }
+        .onChange(of: appState.config.useHindsight) { _, enabled in
+            if enabled {
+                Task { await loadModels() }
+            }
+        }
+    }
+
+    private func loadModels() async {
+        isLoadingModels = true
+        let (chat, embedding) = await appState.fetchAvailableModels()
+        chatModels = chat
+        embeddingModels = embedding
+        isLoadingModels = false
     }
 }
 
@@ -190,6 +243,7 @@ private struct PortsTab: View {
             portField("PostgreSQL Port", value: $appState.config.postgresPort)
             portField("Valkey Port", value: $appState.config.valkeyPort)
             portField("LiteLLM Port", value: $appState.config.litellmPort)
+            portField("Hindsight Port", value: $appState.config.hindsightPort)
 
             HStack {
                 Spacer()

@@ -49,6 +49,8 @@ class HealthChecker {
                 healthy = await processCheck(service: service)
             case "litellm":
                 healthy = await httpCheck(host: service.containerIP ?? "127.0.0.1", port: 4000, path: "/health")
+            case "hindsight":
+                healthy = await httpCheck(host: service.containerIP ?? "127.0.0.1", port: 8888, path: "/health")
             default:
                 continue
             }

@@ -81,6 +81,9 @@ actor ContainerEngine {
     /// Credential encryption key from Keychain, injected into backend/worker containers.
     var credentialEncryptionKey: String = ""
 
+    /// LiteLLM master key from Keychain, used as the LiteLLM API key for all containers.
+    var litellmMasterKey: String = ""
+
     // MARK: - Configuration
 
     /// Sets the bridge API credentials that will be injected into the worker container.
@@ -92,6 +95,11 @@ actor ContainerEngine {
     /// Sets the credential encryption key (from Keychain) for backend/worker containers.
     func setCredentialEncryptionKey(_ key: String) {
         self.credentialEncryptionKey = key
+    }
+
+    /// Sets the LiteLLM master key (from Keychain) injected into litellm, backend, and worker.
+    func setLiteLLMMasterKey(_ key: String) {
+        self.litellmMasterKey = key
     }
 
     // MARK: - Initialization
@@ -144,14 +152,16 @@ actor ContainerEngine {
         )
     }
 
-    /// Removes container directories left over from previous app sessions.
+    /// Removes orphaned task-runner container directories from previous app sessions.
+    /// Service containers (errand-*) are left alone — their stale directories are cleaned
+    /// up individually in createAndStartContainer() right before re-creation.
     private static func cleanupOrphanedContainers(imageStore: ImageStore) {
         let fm = FileManager.default
         let containersDir = imageStore.path.appendingPathComponent("containers")
         guard let entries = try? fm.contentsOfDirectory(atPath: containersDir.path) else { return }
-        let orphans = entries.filter { $0.hasPrefix("errand-") || $0.hasPrefix("task-") }
+        let orphans = entries.filter { $0.hasPrefix("task-") }
         if !orphans.isEmpty {
-            debugLog("[ContainerEngine] Cleaning up \(orphans.count) orphaned container(s)")
+            debugLog("[ContainerEngine] Cleaning up \(orphans.count) orphaned task container(s)")
         }
         for name in orphans {
             try? fm.removeItem(at: containersDir.appendingPathComponent(name))
@@ -250,46 +260,140 @@ actor ContainerEngine {
     typealias LogCallback = @Sendable (String) -> Void
 
     /// Creates and starts a container, returning its ID and IP address.
+    /// Returns the rootfs size in bytes for a given service.
+    /// Larger images (LiteLLM, Hindsight) need more space for extraction plus runtime writes.
+    private func rootfsSize(for serviceId: String) -> UInt64 {
+        switch serviceId {
+        case "litellm":    return 8 * 1024 * 1024 * 1024  // 8 GiB — large Python image
+        case "hindsight":  return 8 * 1024 * 1024 * 1024  // 8 GiB — ~3 GB extracted
+        case "backend":    return 4 * 1024 * 1024 * 1024  // 4 GiB
+        case "worker":     return 4 * 1024 * 1024 * 1024  // 4 GiB
+        default:           return 2 * 1024 * 1024 * 1024  // 2 GiB — small alpine images
+        }
+    }
+
+    /// Estimated actual content size for progress calculation.
+    /// rootfsSize is the sparse file ceiling (much larger than actual content).
+    /// These values are measured from real extractions.
+    private func estimatedContentSize(for serviceId: String) -> UInt64 {
+        switch serviceId {
+        case "litellm":    return 1_500_000_000  // ~1.45 GB measured
+        case "hindsight":  return 3_000_000_000  // ~3 GB estimated
+        case "backend":    return   550_000_000  // ~527 MB measured (errand image)
+        case "worker":     return   550_000_000  // ~527 MB measured (errand image)
+        case "migrate":    return   550_000_000  // ~527 MB measured (errand image)
+        case "postgres":   return   250_000_000  // ~245 MB measured (alpine)
+        case "valkey":     return    15_000_000  // ~9 MB measured (alpine)
+        default:           return   500_000_000  // conservative default
+        }
+    }
+
+    /// Callback for reporting rootfs extraction progress (0.0–1.0).
+    typealias ProgressCallback = @Sendable (Double) -> Void
+
     func createAndStartContainer(
         image: String,
         env: [String: String],
         mounts: [Containerization.Mount],
         ports: [Int: Int],
         command: [String]? = nil,
-        onLog: LogCallback? = nil
+        rootfsSizeInBytes: UInt64 = 4 * 1024 * 1024 * 1024,
+        estimatedContentBytes: UInt64 = 500_000_000,
+        serviceId: String? = nil,
+        onLog: LogCallback? = nil,
+        onPreparingProgress: ProgressCallback? = nil
     ) async throws -> (containerId: String, ip: String) {
         try await ensureInitialized()
         guard var manager else { throw ContainerEngineError.notInitialized }
+        guard let imageStore else { throw ContainerEngineError.notInitialized }
 
-        let containerId = "errand-\(UUID().uuidString.prefix(8).lowercased())"
+        // Use stable IDs for service containers so we can clean up deterministically
+        let containerId = if let serviceId { "errand-\(serviceId)" } else { "errand-\(UUID().uuidString.prefix(8).lowercased())" }
 
-        debugLog("[ContainerEngine] Creating container \(containerId) from \(image) with \(mounts.count) mount(s)")
+        // Remove any leftover container directory from a previous run.
+        // The rootfs.ext4 can't be safely reused (dirty journal from SIGTERM/SIGKILL),
+        // but image layers are still cached in ImageStore so re-extraction is the only cost.
+        let containerDir = imageStore.path
+            .appendingPathComponent("containers")
+            .appendingPathComponent(containerId)
+        if FileManager.default.fileExists(atPath: containerDir.path) {
+            debugLog("[ContainerEngine] Removing stale container directory for \(containerId)")
+            try? FileManager.default.removeItem(at: containerDir)
+        }
+
+        debugLog("[ContainerEngine] Creating container \(containerId) from \(image) with \(mounts.count) mount(s), command=\(command?.description ?? "nil"), rootfs=\(rootfsSizeInBytes / (1024*1024*1024))GiB")
 
         let stdoutWriter = DebugWriter(prefix: "\(containerId) stdout", onLine: onLog)
         let stderrWriter = DebugWriter(prefix: "\(containerId) stderr", onLine: onLog)
 
-        let container = try await manager.create(
-            containerId,
-            reference: image,
-            rootfsSizeInBytes: 4 * 1024 * 1024 * 1024
-        ) { config in
-            config.cpus = 2
-            config.memoryInBytes = 1024 * 1024 * 1024
-            config.process.stdout = stdoutWriter
-            config.process.stderr = stderrWriter
+        // Poll rootfs disk usage during extraction to report progress.
+        // The file is sparse, so allocated blocks / target size gives a rough %.
+        let progressPoller: Task<Void, Never>?
+        if let onPreparingProgress {
+            let targetBytes = estimatedContentBytes
+            let containerDirPath = containerDir.path
+            progressPoller = Task.detached {
+                let fm = FileManager.default
+                var ext4CachedPath: String?
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .milliseconds(500))
 
-            if let command {
-                config.process.arguments = command
-            }
+                    // Find the rootfs ext4 file dynamically (cache path once found)
+                    if ext4CachedPath == nil {
+                        if let enumerator = fm.enumerator(atPath: containerDirPath) {
+                            while let file = enumerator.nextObject() as? String {
+                                if file.hasSuffix(".ext4") {
+                                    ext4CachedPath = containerDirPath + "/" + file
+                                    break
+                                }
+                            }
+                        }
+                    }
 
-            for (key, value) in env {
-                config.process.environmentVariables.append("\(key)=\(value)")
-            }
+                    guard let foundPath = ext4CachedPath else { continue }
 
-            for mount in mounts {
-                config.mounts.append(mount)
+                    let rootfsURL = URL(fileURLWithPath: foundPath)
+                    guard let values = try? rootfsURL.resourceValues(forKeys: [.fileAllocatedSizeKey]),
+                          let allocatedSize = values.fileAllocatedSize else { continue }
+
+                    let progress = min(Double(allocatedSize) / Double(targetBytes), 0.99)
+                    onPreparingProgress(progress)
+                }
             }
+        } else {
+            progressPoller = nil
         }
+
+        let container: LinuxContainer
+        do {
+            container = try await manager.create(
+                containerId,
+                reference: image,
+                rootfsSizeInBytes: rootfsSizeInBytes
+            ) { config in
+                config.cpus = 2
+                config.memoryInBytes = 1024 * 1024 * 1024
+                config.process.stdout = stdoutWriter
+                config.process.stderr = stderrWriter
+
+                if let command {
+                    config.process.arguments = command
+                }
+
+                for (key, value) in env {
+                    config.process.environmentVariables.append("\(key)=\(value)")
+                }
+
+                for mount in mounts {
+                    config.mounts.append(mount)
+                }
+            }
+        } catch {
+            progressPoller?.cancel()
+            throw error
+        }
+        progressPoller?.cancel()
+        onPreparingProgress?(1.0)
 
         debugLog("[ContainerEngine] Container \(containerId) created, calling create()...")
         try await container.create()
@@ -391,106 +495,258 @@ actor ContainerEngine {
     /// Starts all services in dependency order, waiting for each to become healthy.
     /// Returns the updated services array. Calls `onStatus` when each service's status changes.
     /// Calls `onLog` with (serviceId, line) for each container stdout/stderr line.
-    func startAll(services: [ServiceInfo], config: AppConfig, onStatus: StatusCallback? = nil, onLog: (@Sendable (String, String) -> Void)? = nil) async throws -> [ServiceInfo] {
+    func startAll(services: [ServiceInfo], config: AppConfig, onStatus: StatusCallback? = nil, onLog: (@Sendable (String, String) -> Void)? = nil, onPreparingProgress: (@Sendable (String, Double) -> Void)? = nil) async throws -> [ServiceInfo] {
         var services = services
         try await ensureInitialized()
 
         let images = imageSpecs(for: services, config: config)
 
-        // Build startup order, inserting LiteLLM before backend if enabled
-        var order = serviceStartupOrder
-        if config.litellmEnabled && services.contains(where: { $0.id == "litellm" }) {
-            if let backendIdx = order.firstIndex(where: { $0.contains("backend") }) {
-                order.insert(["litellm"], at: backendIdx)
-            }
-        }
+        var skipServices = Set<String>()
+        if !config.useLiteLLM { skipServices.insert("litellm") }
+        if !config.useHindsight { skipServices.insert("hindsight") }
 
+        // Determine which services to start based on dependencies
+        let allServiceIds = serviceDependencies.keys.filter { !skipServices.contains($0) }
         var serviceIPs: [String: String] = [:]
+        var completed = Set<String>()     // Services that finished (healthy or ephemeral exited)
+        var failed = Set<String>()
 
-        for group in order {
-            for serviceId in group {
-                guard let idx = services.firstIndex(where: { $0.id == serviceId }) else { continue }
-                guard let imageName = images[serviceId] else { continue }
-
-                services[idx].status = .pulling
-                onStatus?(serviceId, .pulling)
-
-                debugLog("[ContainerEngine] Pulling image for \(serviceId): \(imageName)")
-                try await pullImage(name: imageName)
-                debugLog("[ContainerEngine] Pull complete for \(serviceId)")
-
-                services[idx].status = .starting
-                onStatus?(serviceId, .starting)
-
-                let env = buildEnv(for: serviceId, config: config, serviceIPs: serviceIPs)
-                let mounts = try buildMountObjects(for: serviceId)
-
-                let logCb: LogCallback? = onLog.map { handler in
-                    let sid = serviceId
-                    return { line in handler(sid, line) }
+        // Mark already-running services as completed (e.g. started during setup wizard)
+        for serviceId in allServiceIds {
+            guard let idx = services.firstIndex(where: { $0.id == serviceId }) else { continue }
+            if services[idx].status == .running, serviceContainerMap[serviceId] != nil {
+                if let ip = services[idx].containerIP {
+                    serviceIPs[serviceId] = ip
                 }
-                let command = commandOverride(for: serviceId)
-                let (containerId, ip) = try await createAndStartContainer(
-                    image: imageName,
-                    env: env,
-                    mounts: mounts,
-                    ports: [:],
-                    command: command,
-                    onLog: logCb
-                )
+                completed.insert(serviceId)
+            }
+        }
 
-                services[idx].containerId = containerId
-                services[idx].containerIP = ip
-                serviceContainerMap[serviceId] = containerId
-                serviceIPs[serviceId] = ip
+        // Also mark skipped dependencies as completed so dependents aren't blocked
+        for serviceId in skipServices {
+            completed.insert(serviceId)
+        }
+
+        // Process services in dependency order, launching in parallel where possible
+        while completed.count + failed.count < allServiceIds.count {
+            try Task.checkCancellation()
+            // Find services whose dependencies are all satisfied
+            let ready = allServiceIds.filter { id in
+                !completed.contains(id) && !failed.contains(id) &&
+                (serviceDependencies[id] ?? []).allSatisfy { completed.contains($0) }
             }
 
-            // Wait for every service in this group to become healthy or complete
-            for serviceId in group {
-                guard let idx = services.firstIndex(where: { $0.id == serviceId }) else { continue }
-                let service = services[idx]
+            guard !ready.isEmpty else {
+                // All remaining services are blocked by failures
+                break
+            }
 
-                if service.isEphemeral {
-                    // Ephemeral containers: wait for exit instead of health-checking
-                    guard let containerId = service.containerId,
-                          let container = containers[containerId] else {
-                        services[idx].status = .error
-                        onStatus?(serviceId, .error)
-                        throw ContainerEngineError.healthCheckTimeout(serviceId)
+            // Start all ready services in parallel using a TaskGroup
+            try await withThrowingTaskGroup(of: (String, ServiceInfo).self) { taskGroup in
+                for serviceId in ready {
+                    guard let idx = services.firstIndex(where: { $0.id == serviceId }) else { continue }
+                    guard let imageName = images[serviceId] else { continue }
+
+                    // Capture values before closure to satisfy Sendable requirements
+                    let serviceSnapshot = services[idx]
+                    let ipsSnapshot = serviceIPs
+
+                    taskGroup.addTask {
+                        return try await self.startSingleService(
+                            serviceId: serviceId,
+                            service: serviceSnapshot,
+                            imageName: imageName,
+                            config: config,
+                            serviceIPs: ipsSnapshot,
+                            onStatus: onStatus,
+                            onLog: onLog,
+                            onPreparingProgress: onPreparingProgress
+                        )
                     }
+                }
 
-                    debugLog("[ContainerEngine] Waiting for ephemeral container \(serviceId) to complete...")
-                    let exitStatus = try await container.wait()
-                    debugLog("[ContainerEngine] Ephemeral container \(serviceId) exited with code \(exitStatus.exitCode)")
-
-                    // Clean up the ephemeral container
-                    try? await container.stop()
-                    try? manager?.delete(containerId)
-                    containers.removeValue(forKey: containerId)
-                    serviceContainerMap.removeValue(forKey: serviceId)
-
-                    if exitStatus.exitCode == 0 {
-                        services[idx].status = .stopped
-                        onStatus?(serviceId, .stopped)
+                for try await (serviceId, updatedService) in taskGroup {
+                    guard let idx = services.firstIndex(where: { $0.id == serviceId }) else { continue }
+                    services[idx] = updatedService
+                    if updatedService.status == .running || updatedService.status == .stopped {
+                        completed.insert(serviceId)
+                        if let ip = updatedService.containerIP {
+                            serviceIPs[serviceId] = ip
+                        }
                     } else {
-                        services[idx].status = .error
-                        onStatus?(serviceId, .error)
-                        throw ContainerEngineError.migrationFailed(exitCode: Int(exitStatus.exitCode))
-                    }
-                } else {
-                    let healthy = try await waitForHealthy(service: service, timeoutSeconds: 120)
-                    if healthy {
-                        services[idx].status = .running
-                        onStatus?(serviceId, .running)
-                    } else {
-                        services[idx].status = .error
-                        onStatus?(serviceId, .error)
-                        throw ContainerEngineError.healthCheckTimeout(serviceId)
+                        failed.insert(serviceId)
                     }
                 }
             }
         }
+
         return services
+    }
+
+    /// Starts a single service: pull, create, start, and wait for healthy/exit.
+    /// Called from startAll's TaskGroup for parallel execution.
+    private func startSingleService(
+        serviceId: String,
+        service: ServiceInfo,
+        imageName: String,
+        config: AppConfig,
+        serviceIPs: [String: String],
+        onStatus: StatusCallback?,
+        onLog: (@Sendable (String, String) -> Void)?,
+        onPreparingProgress: (@Sendable (String, Double) -> Void)?
+    ) async throws -> (String, ServiceInfo) {
+        var service = service
+
+        service.status = .pulling
+        onStatus?(serviceId, .pulling)
+
+        debugLog("[ContainerEngine] Pulling image for \(serviceId): \(imageName)")
+        try await pullImage(name: imageName)
+        debugLog("[ContainerEngine] Pull complete for \(serviceId)")
+
+        service.status = .preparing
+        onStatus?(serviceId, .preparing)
+
+        let env = buildEnv(for: serviceId, config: config, serviceIPs: serviceIPs)
+        let mounts = try buildMountObjects(for: serviceId)
+
+        let logCb: LogCallback? = onLog.map { handler in
+            let sid = serviceId
+            return { line in handler(sid, line) }
+        }
+        let command = commandOverride(for: serviceId)
+        let progressCb: ProgressCallback? = onPreparingProgress.map { handler in
+            let sid = serviceId
+            return { progress in handler(sid, progress) }
+        }
+        let (containerId, ip) = try await createAndStartContainer(
+            image: imageName,
+            env: env,
+            mounts: mounts,
+            ports: [:],
+            command: command,
+            rootfsSizeInBytes: rootfsSize(for: serviceId),
+            estimatedContentBytes: estimatedContentSize(for: serviceId),
+            serviceId: serviceId,
+            onLog: logCb,
+            onPreparingProgress: progressCb
+        )
+
+        service.status = .starting
+        onStatus?(serviceId, .starting)
+        service.containerId = containerId
+        service.containerIP = ip
+        serviceContainerMap[serviceId] = containerId
+
+        // Wait for healthy or ephemeral exit
+        if service.isEphemeral {
+            guard let container = containers[containerId] else {
+                service.status = .error
+                onStatus?(serviceId, .error)
+                throw ContainerEngineError.healthCheckTimeout(serviceId)
+            }
+
+            debugLog("[ContainerEngine] Waiting for ephemeral container \(serviceId) to complete...")
+            let exitStatus = try await container.wait()
+            debugLog("[ContainerEngine] Ephemeral container \(serviceId) exited with code \(exitStatus.exitCode)")
+
+            try? await container.stop()
+            try? manager?.delete(containerId)
+            containers.removeValue(forKey: containerId)
+            serviceContainerMap.removeValue(forKey: serviceId)
+
+            if exitStatus.exitCode == 0 {
+                service.status = .stopped
+                onStatus?(serviceId, .stopped)
+            } else {
+                service.status = .error
+                onStatus?(serviceId, .error)
+                throw ContainerEngineError.migrationFailed(exitCode: Int(exitStatus.exitCode))
+            }
+        } else {
+            let healthy = try await waitForHealthy(service: service, timeoutSeconds: 120)
+            if healthy {
+                service.status = .running
+                onStatus?(serviceId, .running)
+            } else {
+                service.status = .error
+                onStatus?(serviceId, .error)
+                throw ContainerEngineError.healthCheckTimeout(serviceId)
+            }
+        }
+
+        return (serviceId, service)
+    }
+
+    // MARK: - Single Service Start
+
+    /// Starts a single service: pull image, create container, wait for healthy.
+    /// Returns the updated ServiceInfo with containerId, containerIP, and status.
+    func startService(
+        _ service: ServiceInfo,
+        config: AppConfig,
+        serviceIPs: [String: String],
+        onStatus: StatusCallback? = nil,
+        onLog: (@Sendable (String, String) -> Void)? = nil,
+        onPreparingProgress: (@Sendable (String, Double) -> Void)? = nil
+    ) async throws -> ServiceInfo {
+        try await ensureInitialized()
+        var service = service
+
+        guard let imageName = imageReference(for: service.id, config: config) else {
+            throw ContainerEngineError.healthCheckTimeout(service.id)
+        }
+
+        service.status = .pulling
+        onStatus?(service.id, .pulling)
+        try await pullImage(name: imageName)
+
+        service.status = .preparing
+        onStatus?(service.id, .preparing)
+
+        let env = buildEnv(for: service.id, config: config, serviceIPs: serviceIPs)
+        let mounts = try buildMountObjects(for: service.id)
+
+        let logCb: LogCallback? = onLog.map { handler in
+            let sid = service.id
+            return { line in handler(sid, line) }
+        }
+
+        let progressCb: ProgressCallback? = onPreparingProgress.map { handler in
+            let sid = service.id
+            return { progress in handler(sid, progress) }
+        }
+        let (containerId, ip) = try await createAndStartContainer(
+            image: imageName,
+            env: env,
+            mounts: mounts,
+            ports: [:],
+            command: commandOverride(for: service.id),
+            rootfsSizeInBytes: rootfsSize(for: service.id),
+            estimatedContentBytes: estimatedContentSize(for: service.id),
+            serviceId: service.id,
+            onLog: logCb,
+            onPreparingProgress: progressCb
+        )
+
+        service.containerId = containerId
+        service.containerIP = ip
+
+        service.status = .starting
+        onStatus?(service.id, .starting)
+        serviceContainerMap[service.id] = containerId
+
+        let healthy = try await waitForHealthy(service: service, timeoutSeconds: 120)
+        if healthy {
+            service.status = .running
+            onStatus?(service.id, .running)
+        } else {
+            service.status = .error
+            onStatus?(service.id, .error)
+            throw ContainerEngineError.healthCheckTimeout(service.id)
+        }
+
+        return service
     }
 
     // MARK: - Reverse-Order Shutdown (Task 3.6)
@@ -499,12 +755,9 @@ actor ContainerEngine {
     /// Returns the updated services array.
     func stopAll(services: [ServiceInfo]) async throws -> [ServiceInfo] {
         var services = services
-        var order = serviceStartupOrder
-        if services.contains(where: { $0.id == "litellm" && $0.containerId != nil }) {
-            order.append(["litellm"])
-        }
+        let order = serviceShutdownOrder()
 
-        for group in order.reversed() {
+        for group in order {
             for serviceId in group {
                 guard let idx = services.firstIndex(where: { $0.id == serviceId }) else { continue }
                 guard services[idx].containerId != nil else { continue }
@@ -676,6 +929,8 @@ actor ContainerEngine {
             return ["alembic", "upgrade", "head"]
         case "worker":
             return ["python", "worker.py"]
+        case "litellm":
+            return ["litellm", "--config", "/etc/litellm/config.yaml", "--port", "4000", "--host", "0.0.0.0"]
         default:
             return nil
         }
@@ -693,7 +948,9 @@ actor ContainerEngine {
             case "backend", "worker", "migrate":
                 images[service.id] = "ghcr.io/errand-ai/errand:\(config.contentManagerImageTag)"
             case "litellm":
-                images["litellm"] = "ghcr.io/berriai/litellm:latest"
+                images["litellm"] = "ghcr.io/berriai/litellm-database:main-v1.81.3-stable"
+            case "hindsight":
+                images["hindsight"] = "ghcr.io/vectorize-io/hindsight:0.4.13"
             default:
                 break
             }
@@ -732,22 +989,18 @@ actor ContainerEngine {
                 env["VALKEY_URL"] = "redis://\(vkIP):6379"
             }
             env["PORT"] = "\(config.backendPort)"
-            if !config.openaiAPIKey.isEmpty {
-                env["OPENAI_API_KEY"] = config.openaiAPIKey
-            }
-            if !config.openaiBaseURL.isEmpty {
-                env["OPENAI_BASE_URL"] = config.openaiBaseURL
-            }
-            if config.litellmEnabled, let litellmIP = serviceIPs["litellm"] {
+            if let litellmIP = serviceIPs["litellm"] {
                 env["OPENAI_BASE_URL"] = "http://\(litellmIP):\(config.litellmPort)"
+                env["OPENAI_API_KEY"] = litellmMasterKey
+            } else if !config.openaiBaseURL.isEmpty {
+                env["OPENAI_BASE_URL"] = config.openaiBaseURL
+                env["OPENAI_API_KEY"] = config.openaiAPIKey
             }
             if !credentialEncryptionKey.isEmpty {
                 env["CREDENTIAL_ENCRYPTION_KEY"] = credentialEncryptionKey
             }
-            if !config.oidcDiscoveryURL.isEmpty {
-                env["OIDC_DISCOVERY_URL"] = config.oidcDiscoveryURL
-                env["OIDC_CLIENT_ID"] = config.oidcClientID
-                env["OIDC_CLIENT_SECRET"] = config.oidcClientSecret
+            if let hindsightIP = serviceIPs["hindsight"] {
+                env["HINDSIGHT_BASE_URL"] = "http://\(hindsightIP):8888"
             }
 
         case "worker":
@@ -760,14 +1013,19 @@ actor ContainerEngine {
             if let backendIP = serviceIPs["backend"] {
                 env["BACKEND_MCP_URL"] = "http://\(backendIP):\(config.backendPort)/mcp"
             }
-            if !config.openaiAPIKey.isEmpty {
-                env["OPENAI_API_KEY"] = config.openaiAPIKey
-            }
-            if !config.openaiBaseURL.isEmpty {
+            if let litellmIP = serviceIPs["litellm"] {
+                env["OPENAI_BASE_URL"] = "http://\(litellmIP):\(config.litellmPort)"
+                env["OPENAI_API_KEY"] = litellmMasterKey
+            } else if !config.openaiBaseURL.isEmpty {
                 env["OPENAI_BASE_URL"] = config.openaiBaseURL
+                env["OPENAI_API_KEY"] = config.openaiAPIKey
             }
             if !credentialEncryptionKey.isEmpty {
                 env["CREDENTIAL_ENCRYPTION_KEY"] = credentialEncryptionKey
+            }
+            if config.useHindsight, let hindsightIP = serviceIPs["hindsight"] {
+                env["HINDSIGHT_URL"] = "http://\(hindsightIP):8888/"
+                env["HINDSIGHT_BANK_ID"] = "errand-tasks"
             }
             // Bridge API credentials so the worker can create task-runner containers
             env["CONTAINER_RUNTIME"] = "apple"
@@ -775,7 +1033,48 @@ actor ContainerEngine {
             env["CONTAINER_BRIDGE_TOKEN"] = bridgeToken
 
         case "litellm":
-            break
+            env["HOST"] = "0.0.0.0"
+            env["PORT"] = "4000"
+            env["DATABASE_USERNAME"] = "postgres"
+            env["DATABASE_PASSWORD"] = "postgres"
+            if let pgIP = serviceIPs["postgres"] {
+                env["DATABASE_HOST"] = pgIP
+                env["DATABASE_URL"] = "postgresql://postgres:postgres@\(pgIP):5432/litellm"
+            }
+            env["DATABASE_NAME"] = "litellm"
+            if !litellmMasterKey.isEmpty {
+                env["PROXY_MASTER_KEY"] = litellmMasterKey
+                env["LITELLM_MASTER_KEY"] = litellmMasterKey
+            }
+            env["LITELLM_MODE"] = "PRODUCTION"
+            env["LITELLM_PROXY_CONNECTION_TIMEOUT"] = "600"
+
+        case "hindsight":
+            if let pgIP = serviceIPs["postgres"] {
+                env["HINDSIGHT_API_DATABASE_URL"] = "postgresql://postgres:postgres@\(pgIP):5432/hindsight"
+            }
+            env["HINDSIGHT_API_PORT"] = "8888"
+            // Hindsight accepts "openai" as provider — LiteLLM exposes an OpenAI-compatible API
+            env["HINDSIGHT_API_LLM_PROVIDER"] = "openai"
+            env["HINDSIGHT_API_EMBEDDING_PROVIDER"] = "openai"
+            if let litellmIP = serviceIPs["litellm"] {
+                let llmBase = "http://\(litellmIP):\(config.litellmPort)/v1"
+                env["HINDSIGHT_API_LLM_BASE_URL"] = llmBase
+                env["HINDSIGHT_API_LLM_API_KEY"] = litellmMasterKey
+                env["HINDSIGHT_API_EMBEDDING_BASE_URL"] = llmBase
+                env["HINDSIGHT_API_EMBEDDING_API_KEY"] = litellmMasterKey
+            } else if !config.openaiBaseURL.isEmpty {
+                env["HINDSIGHT_API_LLM_BASE_URL"] = config.openaiBaseURL
+                env["HINDSIGHT_API_LLM_API_KEY"] = config.openaiAPIKey
+                env["HINDSIGHT_API_EMBEDDING_BASE_URL"] = config.openaiBaseURL
+                env["HINDSIGHT_API_EMBEDDING_API_KEY"] = config.openaiAPIKey
+            }
+            if !config.hindsightLLMModel.isEmpty {
+                env["HINDSIGHT_API_LLM_MODEL"] = config.hindsightLLMModel
+            }
+            if !config.hindsightEmbeddingModel.isEmpty {
+                env["HINDSIGHT_API_EMBEDDING_LITELLM_MODEL"] = config.hindsightEmbeddingModel
+            }
 
         default:
             break
@@ -817,7 +1116,10 @@ actor ContainerEngine {
                 ),
             ]
         case "litellm":
-            return [.share(source: storageManager.dataPath(for: "litellm"), destination: "/app/config")]
+            let configDir = storageManager.dataPath(for: "litellm")
+            return [.share(source: configDir, destination: "/etc/litellm")]
+        case "hindsight":
+            return [.share(source: storageManager.dataPath(for: "hindsight"), destination: "/data")]
         default:
             return []
         }
@@ -880,7 +1182,9 @@ actor ContainerEngine {
         case "backend":
             return await httpCheck(host: ip, port: 8000, path: "/health")
         case "litellm":
-            return await httpCheck(host: ip, port: 4000, path: "/health")
+            return await httpCheck(host: ip, port: 4000, path: "/health/liveliness")
+        case "hindsight":
+            return await httpCheck(host: ip, port: 8888, path: "/health")
         case "worker":
             return true
         default:

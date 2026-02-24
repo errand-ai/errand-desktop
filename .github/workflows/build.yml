@@ -17,9 +17,8 @@ jobs:
       - name: Build
         run: swift build
 
-      # Tests require Xcode SDK (XCTest). Skip until Xcode is installed on runner.
-      # - name: Test
-      #   run: swift test
+      - name: Test
+        run: swift test
 
   release:
     name: Release
