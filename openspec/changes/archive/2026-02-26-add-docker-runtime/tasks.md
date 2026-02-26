@@ -51,7 +51,7 @@
 
 ## 8. Testing & Validation
 
-- [ ] 8.1 Manually test full service lifecycle (start all → health checks → port access → stop all) with Docker runtime
-- [ ] 8.2 Manually test Apple Containerization runtime still works on macOS 26 + ARM
-- [ ] 8.3 Test runtime switching in Settings (requires service restart)
-- [ ] 8.4 Test setup wizard flow with Docker available and with Docker not available
+- [x] 8.1 Manually test full service lifecycle (start all → health checks → port access → stop all) with Docker runtime
+- [x] 8.2 Manually test Apple Containerization runtime still works on macOS 26 + ARM
+- [x] 8.3 Test runtime switching in Settings (requires service restart)
+- [x] 8.4 Test setup wizard flow with Docker available and with Docker not available
