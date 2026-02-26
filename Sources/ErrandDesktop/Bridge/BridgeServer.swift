@@ -1,18 +1,6 @@
 @preconcurrency import Network
 import Foundation
 
-/// Debug log to file (mirrors ContainerEngine's debugLog).
-private func debugLog(_ message: String) {
-    let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
-    let logPath = "/tmp/errand-debug.log"
-    if let handle = FileHandle(forWritingAtPath: logPath) {
-        handle.seekToEndOfFile()
-        handle.write(line.data(using: .utf8)!)
-        handle.closeFile()
-    } else {
-        FileManager.default.createFile(atPath: logPath, contents: line.data(using: .utf8))
-    }
-}
 
 /// Local HTTP server exposing the container bridge API for the worker.
 /// Binds to the loopback interface only, authenticates via bearer token.
@@ -223,7 +211,8 @@ actor BridgeServer {
     private func handleGetStatus(id: String) async -> HTTPResponse {
         do {
             let (status, exitCode) = try await containerEngine.containerStatus(id)
-            return .json(ContainerStatusResponse(id: id, status: status, exitCode: exitCode))
+            let logs = try? await containerEngine.readContainerLogs(id)
+            return .json(ContainerStatusResponse(id: id, status: status, exitCode: exitCode, logs: logs))
         } catch {
             return .error(404, "Not Found", message: "Container not found: \(id)")
         }

@@ -15,17 +15,21 @@ struct SetupAssistantView: View {
     @State private var availableTags: [String] = []
     @State private var isLoadingTags = false
     @State private var tagFetchError = false
+    @State private var isCheckingDocker = false
 
-    private let totalSteps = 6
+    // Steps: 0=Welcome, 1=Runtime, 2=LLM Config, 3=LLM Start, 4=Agent Memory, 5=Version, 6=Image Pull, 7=Done
+    private let totalSteps = 8
 
     var body: some View {
         VStack(spacing: 0) {
-            // Step indicators
+            // Step indicators — hide the LLM Start dot (step 3) when LiteLLM is off
             HStack(spacing: 8) {
                 ForEach(0..<totalSteps, id: \.self) { i in
-                    Circle()
-                        .fill(i <= step ? Color.accentColor : Color.secondary.opacity(0.3))
-                        .frame(width: 8, height: 8)
+                    if i != 3 || appState.config.useLiteLLM {
+                        Circle()
+                            .fill(i <= step ? Color.accentColor : Color.secondary.opacity(0.3))
+                            .frame(width: 8, height: 8)
+                    }
                 }
             }
             .padding(.top, 16)
@@ -34,11 +38,13 @@ struct SetupAssistantView: View {
             Group {
                 switch step {
                 case 0: welcomeStep
-                case 1: llmStep
-                case 2: agentMemoryStep
-                case 3: versionStep
-                case 4: imagePullStep
-                case 5: doneStep
+                case 1: runtimeStep
+                case 2: llmConfigStep
+                case 3: llmStartStep
+                case 4: agentMemoryStep
+                case 5: versionStep
+                case 6: imagePullStep
+                case 7: doneStep
                 default: EmptyView()
                 }
             }
@@ -50,16 +56,28 @@ struct SetupAssistantView: View {
             // Navigation
             HStack {
                 if step > 0 && step < totalSteps - 1 {
-                    Button("Back") { step -= 1 }
-                        .disabled(isPulling || isStartingSetupServices)
+                    Button("Back") {
+                        if step == 4 && !appState.config.useLiteLLM {
+                            step = 2  // Skip back over LLM Start step
+                        } else {
+                            step -= 1
+                        }
+                    }
+                    .disabled(isPulling || isStartingSetupServices)
                 }
 
                 Spacer()
 
                 if step < totalSteps - 1 {
-                    Button("Continue") { step += 1 }
-                        .keyboardShortcut(.defaultAction)
-                        .disabled(isPulling || isStartingSetupServices)
+                    Button("Continue") {
+                        if step == 2 && !appState.config.useLiteLLM {
+                            step = 4  // Skip LLM Start step
+                        } else {
+                            step += 1
+                        }
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isPulling || isStartingSetupServices)
                 } else {
                     Button("Finish") {
                         appState.completeFirstRun()
@@ -109,7 +127,94 @@ struct SetupAssistantView: View {
         }
     }
 
-    private var llmStep: some View {
+    private var runtimeStep: some View {
+        let installable = RuntimeDetector.detectInstallable()
+
+        return VStack(alignment: .leading, spacing: 16) {
+            Text("Container Runtime")
+                .font(.title2.weight(.semibold))
+
+            Text("Choose how Errand runs containers on your Mac.")
+                .foregroundStyle(.secondary)
+
+            ForEach(installable, id: \.rawValue) { runtime in
+                let isAvailable = appState.availableRuntimes.contains(runtime)
+                let isSelected = appState.config.containerRuntime == runtime.rawValue
+
+                HStack(alignment: .top, spacing: 12) {
+                    Image(systemName: isSelected && isAvailable ? "checkmark.circle.fill" : "circle")
+                        .foregroundStyle(isSelected && isAvailable ? Color.accentColor : Color.secondary)
+                        .font(.title3)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Text(runtime.displayName)
+                                .font(.headline)
+                            if runtime == .docker {
+                                Text("(Recommended)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        Text(runtime.description)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        if !isAvailable {
+                            HStack(spacing: 4) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .font(.caption2)
+                                Text(runtime == .docker ? "Docker is not running" : "Not available on this Mac")
+                                    .font(.caption)
+                            }
+                            .foregroundStyle(.orange)
+                            .padding(.top, 2)
+                        }
+                    }
+                }
+                .opacity(isAvailable ? 1.0 : 0.5)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    guard isAvailable else { return }
+                    appState.config.containerRuntime = runtime.rawValue
+                    appState.activeRuntime = runtime
+                }
+            }
+
+            if !appState.availableRuntimes.contains(.docker) {
+                HStack(spacing: 12) {
+                    Button("Download Docker") {
+                        if let url = URL(string: "https://www.docker.com/products/docker-desktop/") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+
+                    Button("Check Again") {
+                        isCheckingDocker = true
+                        Task {
+                            appState.availableRuntimes = await RuntimeDetector.detectAvailable()
+                            if let preferred = RuntimeDetector.defaultRuntime(from: appState.availableRuntimes) {
+                                appState.config.containerRuntime = preferred.rawValue
+                                appState.activeRuntime = preferred
+                            }
+                            isCheckingDocker = false
+                        }
+                    }
+                    .disabled(isCheckingDocker)
+
+                    if isCheckingDocker {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                }
+                .padding(.top, 4)
+            }
+        }
+    }
+
+    // MARK: - LLM Configuration (choices only, no container startup)
+
+    private var llmConfigStep: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("LLM Configuration")
                 .font(.title2.weight(.semibold))
@@ -117,112 +222,10 @@ struct SetupAssistantView: View {
             Toggle("Use LiteLLM", isOn: $appState.config.useLiteLLM)
 
             if appState.config.useLiteLLM {
-                // Inline container startup progress
-                if isStartingSetupServices {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Starting services...")
-                            .foregroundStyle(.secondary)
-                        ForEach(["postgres", "litellm"], id: \.self) { serviceId in
-                            if let service = appState.services.first(where: { $0.id == serviceId }) {
-                                HStack {
-                                    Text(service.displayName)
-                                        .frame(width: 90, alignment: .leading)
-                                    switch service.status {
-                                    case .pulling:
-                                        ProgressView()
-                                            .controlSize(.small)
-                                        Text("Pulling image...")
-                                            .foregroundStyle(.secondary)
-                                    case .preparing:
-                                        if let progress = service.preparingProgress {
-                                            ProgressView(value: progress)
-                                                .frame(width: 60)
-                                            Text("\(Int(progress * 100))%")
-                                                .foregroundStyle(.secondary)
-                                                .monospacedDigit()
-                                        } else {
-                                            ProgressView()
-                                                .controlSize(.small)
-                                            Text("Preparing...")
-                                                .foregroundStyle(.secondary)
-                                        }
-                                    case .starting:
-                                        ProgressView()
-                                            .controlSize(.small)
-                                        Text("Starting...")
-                                            .foregroundStyle(.secondary)
-                                    case .running:
-                                        Image(systemName: "checkmark.circle.fill")
-                                            .foregroundStyle(.green)
-                                        Text("Running")
-                                            .foregroundStyle(.secondary)
-                                    case .error:
-                                        Image(systemName: "xmark.circle.fill")
-                                            .foregroundStyle(.red)
-                                        Text("Error")
-                                            .foregroundStyle(.red)
-                                    default:
-                                        Text("Waiting...")
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if let error = setupServiceError {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(error)
-                            .foregroundStyle(.red)
-                            .font(.caption)
-                        Button("Retry") {
-                            startLiteLLMServices()
-                        }
-                    }
-                }
-
-                let litellmRunning = appState.services.first(where: { $0.id == "litellm" })?.status == .running
-
-                if litellmRunning {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Button("Open LiteLLM UI") {
-                            if let url = URL(string: "http://localhost:\(appState.config.litellmPort)/ui") {
-                                NSWorkspace.shared.open(url)
-                            }
-                        }
-
-                        if let masterKey = try? KeychainManager.getOrCreateLiteLLMKey() {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Login credentials:")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                HStack(spacing: 4) {
-                                    Text("Username:")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                    Text("admin")
-                                        .font(.caption.monospaced())
-                                        .textSelection(.enabled)
-                                }
-                                HStack(spacing: 4) {
-                                    Text("Password:")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                    Text(masterKey)
-                                        .font(.caption.monospaced())
-                                        .textSelection(.enabled)
-                                }
-                            }
-                        }
-                    }
-                } else if !isStartingSetupServices && setupServiceError == nil {
-                    Button("Open LiteLLM UI") {}
-                        .disabled(true)
-                }
-            }
-
-            if !appState.config.useLiteLLM {
+                Text("LiteLLM provides a unified proxy for multiple LLM providers. Postgres and LiteLLM containers will be started on the next step.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
                 Text("Enter your OpenAI-compatible API credentials.")
                     .foregroundStyle(.secondary)
             }
@@ -242,8 +245,117 @@ struct SetupAssistantView: View {
             }
             .opacity(appState.config.useLiteLLM ? 0.5 : 1.0)
         }
-        .task(id: appState.config.useLiteLLM) {
-            guard appState.config.useLiteLLM else { return }
+    }
+
+    // MARK: - LLM Services Start (only reached if LiteLLM is enabled)
+
+    private var llmStartStep: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Starting LiteLLM Services")
+                .font(.title2.weight(.semibold))
+
+            Text("Pulling images and starting Postgres and LiteLLM containers.")
+                .foregroundStyle(.secondary)
+
+            if isStartingSetupServices {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(["postgres", "litellm"], id: \.self) { serviceId in
+                        if let service = appState.services.first(where: { $0.id == serviceId }) {
+                            HStack {
+                                Text(service.displayName)
+                                    .frame(width: 90, alignment: .leading)
+                                switch service.status {
+                                case .pulling:
+                                    ProgressView()
+                                        .controlSize(.small)
+                                    Text("Pulling image...")
+                                        .foregroundStyle(.secondary)
+                                case .preparing:
+                                    if let progress = service.preparingProgress {
+                                        ProgressView(value: progress)
+                                            .frame(width: 60)
+                                        Text("\(Int(progress * 100))%")
+                                            .foregroundStyle(.secondary)
+                                            .monospacedDigit()
+                                    } else {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                        Text("Preparing...")
+                                            .foregroundStyle(.secondary)
+                                    }
+                                case .starting:
+                                    ProgressView()
+                                        .controlSize(.small)
+                                    Text("Starting...")
+                                        .foregroundStyle(.secondary)
+                                case .running:
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .foregroundStyle(.green)
+                                    Text("Running")
+                                        .foregroundStyle(.secondary)
+                                case .error:
+                                    Image(systemName: "xmark.circle.fill")
+                                        .foregroundStyle(.red)
+                                    Text("Error")
+                                        .foregroundStyle(.red)
+                                default:
+                                    Text("Waiting...")
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let error = setupServiceError {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(error)
+                        .foregroundStyle(.red)
+                        .font(.caption)
+                    Button("Retry") {
+                        startLiteLLMServices()
+                    }
+                }
+            }
+
+            let litellmRunning = appState.services.first(where: { $0.id == "litellm" })?.status == .running
+
+            if litellmRunning {
+                VStack(alignment: .leading, spacing: 6) {
+                    Button("Open LiteLLM UI") {
+                        if let url = URL(string: "http://localhost:\(appState.config.litellmPort)/ui") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+
+                    if let masterKey = try? KeychainManager.getOrCreateLiteLLMKey() {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Login credentials:")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            HStack(spacing: 4) {
+                                Text("Username:")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text("admin")
+                                    .font(.caption.monospaced())
+                                    .textSelection(.enabled)
+                            }
+                            HStack(spacing: 4) {
+                                Text("Password:")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(masterKey)
+                                    .font(.caption.monospaced())
+                                    .textSelection(.enabled)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .task {
             let litellmRunning = appState.services.first(where: { $0.id == "litellm" })?.status == .running
             guard !litellmRunning && !isStartingSetupServices else { return }
             startLiteLLMServices()

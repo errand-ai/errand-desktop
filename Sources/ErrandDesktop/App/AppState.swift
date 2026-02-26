@@ -20,7 +20,10 @@ class AppState: ObservableObject {
     @Published var selectedLogService: String? = nil
     @Published var migrationError: String?
     @Published var keychainError: String?
+    @Published var runtimeError: String?
     @Published var imagePullProgress: [String: Double] = [:]
+    @Published var availableRuntimes: [RuntimeCapability] = []
+    @Published var activeRuntime: RuntimeCapability?
 
     private var containerEngine: ContainerEngine?
     private var storageManager: StorageManager?
@@ -75,8 +78,11 @@ class AppState: ObservableObject {
         containerEngine = ContainerEngine()
         bridgeServer = BridgeServer(containerEngine: containerEngine!)
         healthChecker = HealthChecker(appState: self, containerEngine: containerEngine!)
-        liteLLMManager = LiteLLMManager(containerEngine: containerEngine!)
+        liteLLMManager = LiteLLMManager()
         migrationRunner = MigrationRunner(containerEngine: containerEngine!)
+
+        // Detect available runtimes and configure the engine
+        await detectAndSetRuntime()
 
         // Pass bridge API credentials to ContainerEngine so it can inject them into the worker
         if let token = await bridgeServer?.authToken {
@@ -94,6 +100,52 @@ class AppState: ObservableObject {
 
         // Start checking for updates
         updateChecker.startPeriodicChecks()
+    }
+
+    /// Detects available runtimes and configures the container engine with the preferred one.
+    func detectAndSetRuntime() async {
+        availableRuntimes = await RuntimeDetector.detectAvailable()
+
+        // Determine which runtime to use: prefer user's saved config, fall back to auto-detect
+        let preferred = RuntimeCapability(rawValue: config.containerRuntime)
+        let chosen: RuntimeCapability?
+        if let preferred, availableRuntimes.contains(preferred) {
+            chosen = preferred
+        } else {
+            chosen = RuntimeDetector.defaultRuntime(from: availableRuntimes)
+        }
+
+        guard let chosen else {
+            let msg = "No container runtime available. Install Docker Desktop or upgrade to macOS 26 on Apple Silicon."
+            runtimeError = msg
+            appendLog(service: "system", message: msg)
+            return
+        }
+
+        runtimeError = nil
+        activeRuntime = chosen
+
+        // Update config if it was overridden
+        if config.containerRuntime != chosen.rawValue {
+            config.containerRuntime = chosen.rawValue
+            saveConfig()
+        }
+
+        do {
+            let runtime: any ContainerRuntime
+            switch chosen {
+            case .docker:
+                let socketPath = await RuntimeDetector.findDockerSocket() ?? "/var/run/docker.sock"
+                runtime = DockerRuntime(socketPath: socketPath)
+                appendLog(service: "system", message: "Docker socket: \(socketPath)")
+            case .appleContainerization:
+                runtime = AppleContainerRuntime()
+            }
+            try await containerEngine?.setRuntime(runtime, capability: chosen)
+            appendLog(service: "system", message: "Container runtime: \(chosen.displayName)")
+        } catch {
+            appendLog(service: "system", message: "Failed to initialize \(chosen.displayName) runtime: \(error.localizedDescription)")
+        }
     }
 
     /// Loads credential encryption key and LiteLLM master key from the macOS Keychain.
@@ -148,7 +200,10 @@ class AppState: ObservableObject {
     func startAll() async throws {
         migrationError = nil
 
-        // Refuse to start if keychain secrets are missing
+        // Refuse to start if no runtime or keychain secrets are missing
+        if runtimeError != nil {
+            throw AppError.noRuntime
+        }
         if keychainError != nil {
             throw AppError.keychainNotReady
         }
@@ -156,8 +211,11 @@ class AppState: ObservableObject {
         // Start the bridge API server so the worker can create task-runner containers
         try await bridgeServer?.start()
 
-        // Clear existing port forwards before starting fresh
-        portForwarder.stopAll()
+        // Clear existing port forwards before starting fresh (Docker publishes ports natively)
+        let needsPortForwarding = activeRuntime != .docker
+        if needsPortForwarding {
+            portForwarder.stopAll()
+        }
 
         // Start services in dependency order with UI progress updates.
         // Port forwarding is set up incrementally as each service becomes running,
@@ -175,10 +233,10 @@ class AppState: ObservableObject {
                                 self.services[idx].containerIP = containerIP
                             }
 
-                            // Set up port forwarding and notify as soon as the service is running
+                            // Set up port forwarding (Apple Containerization only) and notify
                             if status == .running {
                                 let service = self.services[idx]
-                                if let port = service.port, let ip = service.containerIP {
+                                if needsPortForwarding, let port = service.port, let ip = service.containerIP {
                                     let remotePort = service.containerPort ?? port
                                     do {
                                         try self.portForwarder.forward(localPort: port, to: ip, remotePort: remotePort)
@@ -229,7 +287,9 @@ class AppState: ObservableObject {
         }
 
         healthChecker?.stopMonitoring()
-        portForwarder.stopAll()
+        if activeRuntime != .docker {
+            portForwarder.stopAll()
+        }
         if let engine = containerEngine {
             services = try await engine.stopAll(
                 services: services,
@@ -278,8 +338,13 @@ class AppState: ObservableObject {
             guard let imageRef = await containerEngine?.imageReference(for: service.id, config: config) else {
                 continue
             }
+            let serviceId = service.id
             do {
-                try await containerEngine?.pullImage(name: imageRef)
+                try await containerEngine?.pullImage(name: imageRef) { [weak self] progress in
+                    Task { @MainActor in
+                        self?.imagePullProgress[serviceId] = progress
+                    }
+                }
                 imagePullProgress[service.id] = 1.0
             } catch {
                 appendLog(service: service.id, message: "Failed to pull image: \(error.localizedDescription)")
@@ -364,8 +429,8 @@ class AppState: ObservableObject {
                 onPreparingProgress: progressCallback
             )
 
-            // Set up port forwarding for LiteLLM so localhost:{litellmPort} works
-            if let ip = services[litellmIdx].containerIP {
+            // Set up port forwarding for LiteLLM so localhost:{litellmPort} works (Apple only; Docker publishes natively)
+            if activeRuntime != .docker, let ip = services[litellmIdx].containerIP {
                 try portForwarder.forward(localPort: config.litellmPort, to: ip, remotePort: 4000)
             }
         }
@@ -444,11 +509,14 @@ class AppState: ObservableObject {
 /// Errors that prevent the app from starting services.
 enum AppError: Error, LocalizedError {
     case keychainNotReady
+    case noRuntime
 
     var errorDescription: String? {
         switch self {
         case .keychainNotReady:
             return "Cannot start services: encryption keys could not be loaded from the macOS Keychain."
+        case .noRuntime:
+            return "Cannot start services: no container runtime available. Install Docker Desktop or upgrade to macOS 26 on Apple Silicon."
         }
     }
 }

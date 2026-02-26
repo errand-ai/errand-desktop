@@ -46,6 +46,27 @@ private struct GeneralTab: View {
 
     var body: some View {
         Form {
+            // Runtime selection
+            if appState.availableRuntimes.count > 1 {
+                LabeledContent("Container Runtime") {
+                    Picker("", selection: $appState.config.containerRuntime) {
+                        ForEach(appState.availableRuntimes, id: \.rawValue) { runtime in
+                            Text(runtime.displayName).tag(runtime.rawValue)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 200)
+                }
+                Text("Changing the runtime requires restarting all services.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if let active = appState.activeRuntime {
+                LabeledContent("Container Runtime") {
+                    Text(active.displayName)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             Toggle("Launch at Login", isOn: $appState.config.launchAtLogin)
                 .onChange(of: appState.config.launchAtLogin) { _, enabled in
                     guard !isUpdatingLoginItem else {

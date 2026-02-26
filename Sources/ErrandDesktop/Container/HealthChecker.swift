@@ -46,18 +46,27 @@ class HealthChecker {
                 continue
             }
 
+            // Docker publishes ports to localhost; Apple uses container IPs directly
+            let isDocker = appState.activeRuntime == .docker
+            let host = isDocker ? "127.0.0.1" : (service.containerIP ?? "127.0.0.1")
+
             let healthy: Bool
             switch service.id {
             case "postgres":
-                healthy = await tcpCheck(host: service.containerIP ?? "127.0.0.1", port: 5432)
+                let port = isDocker ? appState.config.postgresPort : 5432
+                healthy = await tcpCheck(host: host, port: port)
             case "valkey":
-                healthy = await tcpCheck(host: service.containerIP ?? "127.0.0.1", port: 6379)
+                let port = isDocker ? appState.config.valkeyPort : 6379
+                healthy = await tcpCheck(host: host, port: port)
             case "backend":
-                healthy = await httpCheck(host: service.containerIP ?? "127.0.0.1", port: 8000, path: "/health")
+                let port = isDocker ? appState.config.backendPort : 8000
+                healthy = await httpCheck(host: host, port: port, path: "/health")
             case "litellm":
-                healthy = await httpCheck(host: service.containerIP ?? "127.0.0.1", port: 4000, path: "/health/liveliness")
+                let port = isDocker ? appState.config.litellmPort : 4000
+                healthy = await httpCheck(host: host, port: port, path: "/health/liveliness")
             case "hindsight":
-                healthy = await httpCheck(host: service.containerIP ?? "127.0.0.1", port: 8888, path: "/health")
+                let port = isDocker ? appState.config.hindsightPort : 8888
+                healthy = await httpCheck(host: host, port: port, path: "/health")
             default:
                 continue
             }

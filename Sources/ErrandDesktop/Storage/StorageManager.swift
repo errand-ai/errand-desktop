@@ -28,7 +28,7 @@ class StorageManager {
 
     /// Creates the data directories for container volumes.
     func ensureDataDirectories() {
-        let subdirs = ["litellm", "hindsight"]
+        let subdirs = ["postgres", "valkey", "litellm", "hindsight"]
         for sub in subdirs {
             let dir = dataDir.appendingPathComponent(sub)
             try? fm.createDirectory(at: dir, withIntermediateDirectories: true)

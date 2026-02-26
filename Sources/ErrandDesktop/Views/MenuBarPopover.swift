@@ -10,7 +10,9 @@ struct MenuBarPopover: View {
             header
             Divider()
 
-            if let keychainError = appState.keychainError {
+            if let runtimeError = appState.runtimeError {
+                runtimeErrorBanner(runtimeError)
+            } else if let keychainError = appState.keychainError {
                 keychainErrorBanner(keychainError)
             } else if appState.isFirstRun {
                 firstRunPrompt
@@ -42,6 +44,32 @@ struct MenuBarPopover: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
+    }
+
+    private func runtimeErrorBanner(_ message: String) -> some View {
+        VStack(spacing: 8) {
+            Image(systemName: "shippingbox.slash")
+                .font(.title2)
+                .foregroundStyle(.orange)
+            Text("No Container Runtime")
+                .font(.subheadline.weight(.medium))
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Button("Download Docker") {
+                if let url = URL(string: "https://www.docker.com/products/docker-desktop/") {
+                    NSWorkspace.shared.open(url)
+                }
+            }
+            Button("Check Again") {
+                Task {
+                    await appState.detectAndSetRuntime()
+                }
+            }
+        }
+        .padding()
+        .frame(maxWidth: .infinity)
     }
 
     private func keychainErrorBanner(_ message: String) -> some View {
@@ -82,11 +110,14 @@ struct MenuBarPopover: View {
     }
 
     /// URLs for services that have a web UI, keyed by service id.
-    private static let webUIURLs: [String: String] = [
-        "litellm": "http://localhost:4000/ui",
-        "hindsight": "http://localhost:9999",
-        "backend": "http://localhost:8000",
-    ]
+    private func webUIURL(for serviceId: String) -> String? {
+        switch serviceId {
+        case "litellm": return "http://localhost:\(appState.config.litellmPort)/ui"
+        case "hindsight": return "http://localhost:\(appState.config.hindsightPort)"
+        case "backend": return "http://localhost:\(appState.config.backendPort)"
+        default: return nil
+        }
+    }
 
     private var serviceList: some View {
         VStack(spacing: 2) {
@@ -106,7 +137,7 @@ struct MenuBarPopover: View {
                         Text(service.status.label)
                             .font(.caption)
                             .foregroundStyle(service.status.color)
-                    } else if service.status == .running, let urlString = Self.webUIURLs[service.id] {
+                    } else if service.status == .running, let urlString = webUIURL(for: service.id) {
                         Button {
                             openWebUI(serviceId: service.id, urlString: urlString)
                         } label: {
@@ -152,7 +183,7 @@ struct MenuBarPopover: View {
                 Button("Start All") {
                     appState.startAllInBackground()
                 }
-                .disabled(appState.appStatus != .idle)
+                .disabled(appState.appStatus == .starting)
 
                 Button("Stop All") {
                     Task {

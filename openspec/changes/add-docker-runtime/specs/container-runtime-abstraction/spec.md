@@ -5,7 +5,7 @@ The system SHALL define a `ContainerRuntime` protocol that abstracts all contain
 
 #### Scenario: Protocol defines required operations
 - **WHEN** a new container runtime is implemented
-- **THEN** it MUST implement: `pullImage`, `createContainer`, `startContainer`, `stopContainer`, `removeContainer`, `execInContainer`, `containerStatus`, and `containerLogs`
+- **THEN** it MUST implement: `pullImage`, `createContainer`, `startContainer`, `stopContainer`, `removeContainer`, `execInContainer`, `containerIP`, `containerLogs`, and `cleanup`
 
 #### Scenario: Runtime-agnostic service startup
 - **WHEN** `ContainerEngine` starts a service

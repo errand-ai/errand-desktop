@@ -116,16 +116,3 @@ final class PortForwarder: @unchecked Sendable {
     }
 }
 
-/// Debug log helper (defined in ContainerEngine.swift, referenced here).
-/// Uses the same /tmp/errand-debug.log file.
-private func debugLog(_ message: String) {
-    let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
-    let logPath = "/tmp/errand-debug.log"
-    if let handle = FileHandle(forWritingAtPath: logPath) {
-        handle.seekToEndOfFile()
-        handle.write(line.data(using: .utf8)!)
-        handle.closeFile()
-    } else {
-        FileManager.default.createFile(atPath: logPath, contents: line.data(using: .utf8))
-    }
-}

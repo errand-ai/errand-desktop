@@ -1,5 +1,4 @@
 import Foundation
-import Containerization
 
 /// A single LiteLLM model provider configuration entry.
 struct LiteLLMProvider: Codable, Identifiable, Sendable {
@@ -15,23 +14,15 @@ struct LiteLLMProvider: Codable, Identifiable, Sendable {
     }
 }
 
-/// Manages the optional LiteLLM proxy container.
-/// Handles config.yaml generation, container lifecycle, and provides the proxy URL.
+/// Manages LiteLLM proxy configuration.
+/// Handles config.yaml generation and provider persistence.
 actor LiteLLMManager {
-    private let containerEngine: ContainerEngine
     private let configDirectory: URL
     private let configFileURL: URL
 
-    static let imageName = "ghcr.io/berriai/litellm:latest"
-    static let defaultPort = 4000
-
     private(set) var providers: [LiteLLMProvider] = []
-    private(set) var containerIP: String?
-    private(set) var isRunning = false
 
-    init(containerEngine: ContainerEngine) {
-        self.containerEngine = containerEngine
-
+    init() {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         self.configDirectory = appSupport
             .appendingPathComponent("ErrandDesktop")
@@ -85,62 +76,4 @@ actor LiteLLMManager {
         try yaml.write(to: configFileURL, atomically: true, encoding: .utf8)
     }
 
-    // MARK: - Container Lifecycle
-
-    /// Pulls the LiteLLM container image.
-    func pullImage() async throws {
-        try await containerEngine.pullImage(name: Self.imageName)
-    }
-
-    /// Starts the LiteLLM proxy container with the generated config.yaml mounted.
-    func start(port: Int = defaultPort) async throws {
-        guard !isRunning else { return }
-
-        // Ensure config.yaml exists
-        if !FileManager.default.fileExists(atPath: configFileURL.path) {
-            try generateConfigYAML()
-        }
-
-        let env: [String: String] = [:]
-        let mounts: [Containerization.Mount] = [
-            .share(source: configFileURL.path, destination: "/app/config.yaml"),
-        ]
-
-        let (containerId, ip) = try await containerEngine.createAndStartContainer(
-            image: Self.imageName,
-            env: env,
-            mounts: mounts,
-            ports: [port: 4000]
-        )
-
-        containerIP = ip
-        isRunning = true
-        _ = containerId // Stored by ContainerEngine in ServiceInfo
-    }
-
-    /// Stops the LiteLLM container.
-    func stop() async throws {
-        guard isRunning else { return }
-        try await containerEngine.stopContainer(serviceId: "litellm")
-        containerIP = nil
-        isRunning = false
-    }
-
-    // MARK: - Proxy URL
-
-    /// Returns the LiteLLM proxy base URL, or nil if not running.
-    func proxyBaseURL(port: Int = defaultPort) -> String? {
-        guard isRunning, let ip = containerIP else { return nil }
-        return "http://\(ip):\(port)"
-    }
-
-    /// Resolves the effective OPENAI_BASE_URL.
-    /// When LiteLLM is enabled and running, routes through the proxy.
-    /// Otherwise falls back to the direct URL from config.
-    func resolveOpenAIBaseURL(config: AppConfig) -> String {
-        if let proxy = proxyBaseURL(port: config.litellmPort) {
-            return proxy
-        }
-        return config.openaiBaseURL
-    }
 }

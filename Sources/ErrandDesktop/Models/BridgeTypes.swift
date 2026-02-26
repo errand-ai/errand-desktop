@@ -17,6 +17,7 @@ struct ContainerStatusResponse: Codable, Sendable {
     let id: String
     let status: String  // "running", "exited"
     let exitCode: Int?
+    let logs: String?
 }
 
 /// Container output response (result.json contents).
