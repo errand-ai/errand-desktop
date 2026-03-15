@@ -14,11 +14,8 @@ all: run
 build:
 	$(SWIFT) build
 
-sign: build
-	codesign --force --sign - --entitlements $(ENTITLEMENTS) $(BINARY)
-
 # Build a proper .app bundle in /var/tmp (vmnet workaround) and launch
-run: sign stop
+run: build stop
 	@mkdir -p $(MACOS_DIR) $(RESOURCES_DIR)
 	@cp $(BINARY) $(MACOS_DIR)/ErrandDesktop
 	@mkdir -p $(RESOURCES_DIR)/ErrandDesktop_ErrandDesktop.bundle

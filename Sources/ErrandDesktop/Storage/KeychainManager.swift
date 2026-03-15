@@ -43,7 +43,10 @@ enum KeychainManager {
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
 
-        if status == errSecItemNotFound {
+        if status == errSecItemNotFound || status == errSecInteractionNotAllowed {
+            // errSecInteractionNotAllowed: item exists but belongs to a different
+            // code signature and macOS won't prompt for access. Treat as not found
+            // so getOrCreate() will delete and recreate it.
             return nil
         }
         guard status == errSecSuccess, let data = result as? Data,
@@ -66,18 +69,37 @@ enum KeychainManager {
         var addQuery = query
         addQuery[kSecValueData as String] = data
         addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
-        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+        var addStatus = SecItemAdd(addQuery as CFDictionary, nil)
 
-        if addStatus == errSecDuplicateItem {
-            // Item exists but belongs to a different code signature (delete couldn't remove it).
-            // Update in place instead.
-            let updateStatus = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
-            guard updateStatus == errSecSuccess else {
-                throw KeychainError.unhandledError(status: updateStatus)
-            }
-        } else if addStatus != errSecSuccess {
+        if addStatus == errSecDuplicateItem || addStatus == errSecInteractionNotAllowed {
+            // Item exists but belongs to a different code signature.
+            // The Security framework can't delete/update it, but the `security` CLI can.
+            shellDeleteKeychainItem(service: service, account: account)
+
+            // Retry the add after shell deletion.
+            addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+        }
+
+        guard addStatus == errSecSuccess else {
             throw KeychainError.unhandledError(status: addStatus)
         }
+    }
+
+    /// Deletes a keychain item using the `security` CLI tool, which can remove items
+    /// regardless of code signature ACLs.
+    private static func shellDeleteKeychainItem(service: String, account: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        process.arguments = [
+            "delete-generic-password",
+            "-s", service,
+            "-a", account,
+            "login.keychain-db"
+        ]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try? process.run()
+        process.waitUntilExit()
     }
 
     /// Deletes a Keychain item by account name.

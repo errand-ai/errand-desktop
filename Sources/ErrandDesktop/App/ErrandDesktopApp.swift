@@ -4,16 +4,6 @@ import SwiftUI
 struct ErrandDesktopApp: App {
     @StateObject private var appState = AppState()
 
-    init() {
-        // Start initialization at app launch so auto-start works without
-        // waiting for the user to click the menu bar icon. The popover's
-        // .task also calls initialize(), but the guard ensures it only runs once.
-        let state = _appState.wrappedValue
-        Task { @MainActor in
-            await state.initialize()
-        }
-    }
-
     var body: some Scene {
         MenuBarExtra {
             MenuBarPopover()
