@@ -4,13 +4,18 @@ import SwiftUI
 struct ErrandDesktopApp: App {
     @StateObject private var appState = AppState()
 
+    init() {
+        // Trigger initialization immediately on app launch, not when the popover opens.
+        let state = _appState.wrappedValue
+        Task { @MainActor in
+            await state.initialize()
+        }
+    }
+
     var body: some Scene {
         MenuBarExtra {
             MenuBarPopover()
                 .environmentObject(appState)
-                .task {
-                    await appState.initialize()
-                }
         } label: {
             if let url = Bundle.module.url(forResource: "menubar-icon", withExtension: "png"),
                let nsImage = NSImage(contentsOf: url) {

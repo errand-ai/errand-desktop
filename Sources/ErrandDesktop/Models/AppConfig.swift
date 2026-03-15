@@ -22,6 +22,7 @@ struct AppConfig: Codable, Sendable {
     var useGoogleDrive: Bool = false
     var useOneDrive: Bool = false
     var containerRuntime: String = "docker"
+    var autoStartContainers: Bool = true
     var launchAtLogin: Bool = false
     var contentManagerImageTag: String = "latest"
     var showBetaVersions: Bool = false
@@ -47,6 +48,7 @@ struct AppConfig: Codable, Sendable {
         useGoogleDrive = (try? c.decode(Bool.self, forKey: .useGoogleDrive)) ?? defaults.useGoogleDrive
         useOneDrive = (try? c.decode(Bool.self, forKey: .useOneDrive)) ?? defaults.useOneDrive
         containerRuntime = (try? c.decode(String.self, forKey: .containerRuntime)) ?? defaults.containerRuntime
+        autoStartContainers = (try? c.decode(Bool.self, forKey: .autoStartContainers)) ?? defaults.autoStartContainers
         launchAtLogin = (try? c.decode(Bool.self, forKey: .launchAtLogin)) ?? defaults.launchAtLogin
         contentManagerImageTag = (try? c.decode(String.self, forKey: .contentManagerImageTag)) ?? defaults.contentManagerImageTag
         showBetaVersions = (try? c.decode(Bool.self, forKey: .showBetaVersions)) ?? defaults.showBetaVersions

@@ -70,6 +70,11 @@ private struct GeneralTab: View {
                 }
             }
 
+            Toggle("Auto-start containers on launch", isOn: $appState.config.autoStartContainers)
+                .onChange(of: appState.config.autoStartContainers) { _, _ in
+                    appState.saveConfig()
+                }
+
             Toggle("Launch at Login", isOn: $appState.config.launchAtLogin)
                 .onChange(of: appState.config.launchAtLogin) { _, enabled in
                     guard !isUpdatingLoginItem else {

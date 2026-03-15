@@ -22,9 +22,7 @@ let package = Package(
                 .product(name: "ContainerizationEXT4", package: "containerization"),
             ],
             path: "Sources/ErrandDesktop",
-            resources: [
-                .process("Resources"),
-            ]
+            exclude: ["Resources"]
         ),
         .testTarget(
             name: "ErrandDesktopTests",

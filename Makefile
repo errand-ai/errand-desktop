@@ -21,7 +21,8 @@ sign: build
 run: sign stop
 	@mkdir -p $(MACOS_DIR) $(RESOURCES_DIR)
 	@cp $(BINARY) $(MACOS_DIR)/ErrandDesktop
-	@cp -R $(BUILD_DIR)/*.bundle $(RESOURCES_DIR)/ 2>/dev/null || true
+	@mkdir -p $(RESOURCES_DIR)/ErrandDesktop_ErrandDesktop.bundle
+	@cp Sources/ErrandDesktop/Resources/*.png $(RESOURCES_DIR)/ErrandDesktop_ErrandDesktop.bundle/ 2>/dev/null || true
 	@cp Sources/ErrandDesktop/Resources/AppIcon.icns $(RESOURCES_DIR)/AppIcon.icns 2>/dev/null || true
 	@/usr/libexec/PlistBuddy -c "Delete :CFBundleIdentifier" $(CONTENTS)/Info.plist 2>/dev/null; \
 	 /usr/libexec/PlistBuddy \

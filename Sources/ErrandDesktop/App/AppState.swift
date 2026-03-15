@@ -102,6 +102,11 @@ class AppState: ObservableObject {
 
         // Start checking for updates
         updateChecker.startPeriodicChecks()
+
+        // Auto-start containers if enabled and not first run (first run uses the setup wizard)
+        if !isFirstRun && config.autoStartContainers && keychainError == nil && runtimeError == nil {
+            startAllInBackground()
+        }
     }
 
     /// Detects available runtimes and configures the container engine with the preferred one.
