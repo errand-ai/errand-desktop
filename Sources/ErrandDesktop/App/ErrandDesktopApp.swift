@@ -16,6 +16,7 @@ struct ErrandDesktopApp: App {
                let nsImage = NSImage(contentsOf: url) {
                 Image(nsImage: {
                     nsImage.size = NSSize(width: 18, height: 18)
+                    nsImage.isTemplate = true
                     return nsImage
                 }())
             } else {

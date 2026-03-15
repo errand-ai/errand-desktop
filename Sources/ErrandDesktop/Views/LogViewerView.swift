@@ -76,9 +76,9 @@ private struct LogEntryRow: View {
         "postgres": .blue,
         "valkey": .purple,
         "backend": .green,
-        "worker": .orange,
         "litellm": .cyan,
         "hindsight": .mint,
+        "playwright": .orange,
     ]
 
     var body: some View {

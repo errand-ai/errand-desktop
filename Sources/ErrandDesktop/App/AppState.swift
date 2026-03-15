@@ -8,10 +8,12 @@ class AppState: ObservableObject {
         ServiceInfo(id: "postgres", displayName: "PostgreSQL", port: 5432),
         ServiceInfo(id: "valkey", displayName: "Valkey", port: 6379),
         ServiceInfo(id: "migrate", displayName: "Migrate", isEphemeral: true),
+        ServiceInfo(id: "gdrive-mcp", displayName: "Google Drive MCP"),
+        ServiceInfo(id: "onedrive-mcp", displayName: "OneDrive MCP"),
         ServiceInfo(id: "litellm", displayName: "LiteLLM", port: 4000),
         ServiceInfo(id: "hindsight", displayName: "Hindsight", port: 9999),
+        ServiceInfo(id: "playwright", displayName: "Playwright"),
         ServiceInfo(id: "backend", displayName: "Errand Service", port: 8000),
-        ServiceInfo(id: "worker", displayName: "Errand Agent"),
     ]
 
     @Published var config: AppConfig = AppConfig()
@@ -254,6 +256,10 @@ class AppState: ObservableObject {
                                 }
                                 let displayName = service.displayName
                                 Task { await NotificationManager.postServiceStarted(displayName) }
+                            } else if status == .error {
+                                let service = self.services[idx]
+                                let displayName = service.displayName
+                                Task { await NotificationManager.postServiceError(displayName, error: "\(displayName) failed to start. Check Logs for details.") }
                             }
                         }
                     }
@@ -327,14 +333,24 @@ class AppState: ObservableObject {
     }
 
     func appendLog(service: String, message: String) {
-        logs.append(LogEntry(timestamp: Date(), service: service, message: message))
+        let cleaned = message.replacingOccurrences(
+            of: "\u{1B}\\[[0-9;]*[A-Za-z]",
+            with: "",
+            options: .regularExpression
+        )
+        logs.append(LogEntry(timestamp: Date(), service: service, message: cleaned))
     }
 
     func pullRequiredImages() async {
-        for service in services {
+        let requiredServices = services.filter { service in
+            if service.id == "litellm" && !config.deployLiteLLM { return false }
+            if service.id == "hindsight" && !config.useHindsight { return false }
+            return true
+        }
+        for service in requiredServices {
             imagePullProgress[service.id] = 0.0
         }
-        for service in services {
+        for service in requiredServices {
             guard let imageRef = await containerEngine?.imageReference(for: service.id, config: config) else {
                 continue
             }
@@ -355,6 +371,7 @@ class AppState: ObservableObject {
     func completeFirstRun() {
         isFirstRun = false
         saveConfig()
+        startAllInBackground()
     }
 
     // MARK: - Setup Services
@@ -398,6 +415,9 @@ class AppState: ObservableObject {
                             if let containerIP {
                                 self?.services[idx].containerIP = containerIP
                             }
+                            if status == .error, let displayName = self?.services[idx].displayName {
+                                Task { await NotificationManager.postServiceError(displayName, error: "\(displayName) failed to start. Check Logs for details.") }
+                            }
                         }
                     }
                 },
@@ -422,6 +442,9 @@ class AppState: ObservableObject {
                             if let containerIP {
                                 self?.services[idx].containerIP = containerIP
                             }
+                            if status == .error, let displayName = self?.services[idx].displayName {
+                                Task { await NotificationManager.postServiceError(displayName, error: "\(displayName) failed to start. Check Logs for details.") }
+                            }
                         }
                     }
                 },
@@ -433,6 +456,9 @@ class AppState: ObservableObject {
             if activeRuntime != .docker, let ip = services[litellmIdx].containerIP {
                 try portForwarder.forward(localPort: config.litellmPort, to: ip, remotePort: 4000)
             }
+
+            // Provision scoped service keys now that LiteLLM is healthy
+            await engine.provisionServiceKeys(config: config)
         }
     }
 
@@ -444,14 +470,18 @@ class AppState: ObservableObject {
         let mode: String
     }
 
-    /// Fetches available models from the LLM base URL.
-    /// Returns (chatModels, embeddingModels) filtered by mode.
+    /// Fetches available models from the configured LLM provider.
+    /// Returns (chatModels, embeddingModels). For litellm providers, models are filtered by mode.
+    /// For openai_compatible providers, all models appear in both lists.
+    /// For unknown providers, returns empty (caller should show free text fields).
     func fetchAvailableModels() async -> (chat: [ModelInfo], embedding: [ModelInfo]) {
+        let providerType: ProviderType
         let baseURL: String
         let apiKey: String
 
-        if config.useLiteLLM {
-            baseURL = "http://localhost:\(config.litellmPort)/v1"
+        if config.deployLiteLLM {
+            providerType = .litellm
+            baseURL = "http://localhost:\(config.litellmPort)"
             do {
                 apiKey = try KeychainManager.getOrCreateLiteLLMKey()
             } catch {
@@ -459,15 +489,27 @@ class AppState: ObservableObject {
                 return ([], [])
             }
         } else {
-            baseURL = config.openaiBaseURL
-            apiKey = config.openaiAPIKey
+            providerType = ProviderType(rawValue: config.llmProviderType) ?? .unknown
+            baseURL = config.llmProviderBaseURL
+            apiKey = config.llmProviderAPIKey
         }
 
-        // Use /model/info which includes the mode field (chat, embedding)
-        let infoBaseURL = config.useLiteLLM
-            ? "http://localhost:\(config.litellmPort)"
-            : baseURL
-        guard let url = URL(string: "\(infoBaseURL)/model/info") else { return ([], []) }
+        guard providerType != .unknown else { return ([], []) }
+
+        switch providerType {
+        case .litellm:
+            return await fetchLiteLLMModels(baseURL: baseURL, apiKey: apiKey)
+        case .openaiCompatible:
+            return await fetchOpenAIModels(baseURL: baseURL, apiKey: apiKey)
+        case .unknown:
+            return ([], [])
+        }
+    }
+
+    /// Fetches models from a LiteLLM /model/info endpoint, filtering by mode.
+    private func fetchLiteLLMModels(baseURL: String, apiKey: String) async -> (chat: [ModelInfo], embedding: [ModelInfo]) {
+        let strippedURL = baseURL.hasSuffix("/v1") ? String(baseURL.dropLast(3)) : baseURL
+        guard let url = URL(string: "\(strippedURL)/model/info") else { return ([], []) }
 
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
@@ -488,16 +530,38 @@ class AppState: ObservableObject {
                 let mode = modelInfo?["mode"] as? String ?? ""
                 let info = ModelInfo(id: name, mode: mode)
                 switch mode {
-                case "chat":
-                    chat.append(info)
-                case "embedding":
-                    embedding.append(info)
-                default:
-                    break
+                case "chat": chat.append(info)
+                case "embedding": embedding.append(info)
+                default: break
                 }
             }
-
             return (chat, embedding)
+        } catch {
+            appendLog(service: "system", message: "Failed to fetch models: \(error.localizedDescription)")
+            return ([], [])
+        }
+    }
+
+    /// Fetches models from a standard OpenAI-compatible /models endpoint.
+    /// Returns all models in both chat and embedding lists (no mode filtering available).
+    private func fetchOpenAIModels(baseURL: String, apiKey: String) async -> (chat: [ModelInfo], embedding: [ModelInfo]) {
+        guard let url = URL(string: "\(baseURL)/models") else { return ([], []) }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 10
+
+        do {
+            let (data, _) = try await URLSession.shared.data(for: request)
+            let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            let models = json?["data"] as? [[String: Any]] ?? []
+
+            let all = models.compactMap { model -> ModelInfo? in
+                guard let id = model["id"] as? String else { return nil }
+                return ModelInfo(id: id, mode: "")
+            }
+            return (all, all)
         } catch {
             appendLog(service: "system", message: "Failed to fetch models: \(error.localizedDescription)")
             return ([], [])

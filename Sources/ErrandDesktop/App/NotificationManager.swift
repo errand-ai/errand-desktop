@@ -1,9 +1,10 @@
+import AppKit
 import Foundation
 @preconcurrency import UserNotifications
 
 /// Posts macOS user notifications for container lifecycle events and errors.
-/// Guards against missing bundle identifiers (e.g. ad-hoc signed dev builds)
-/// which cause UNUserNotificationCenter.current() to crash.
+/// When running as a proper app bundle, uses UNUserNotificationCenter.
+/// Falls back to osascript for dev builds without a bundle identifier.
 enum NotificationManager {
 
     /// Whether the app is running as a proper bundle with an identifier.
@@ -13,6 +14,14 @@ enum NotificationManager {
         // because responsibleProcess inheritance can give a misleading bundleIdentifier.
         guard Bundle.main.bundleIdentifier != nil else { return false }
         return Bundle.main.infoDictionary != nil
+    }()
+
+    /// Path to a temporary copy of the app logo for notification attachments.
+    private static let logoURL: URL? = {
+        guard let resource = Bundle.module.url(forResource: "errand-logo", withExtension: "png") else { return nil }
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("errand-notification-logo.png")
+        try? FileManager.default.copyItem(at: resource, to: tmp)
+        return tmp
     }()
 
     /// Requests notification authorization if not already granted.
@@ -59,24 +68,46 @@ enum NotificationManager {
         body: String,
         sound: UNNotificationSound = .default
     ) async {
-        guard hasBundleIdentifier else { return }
-        let center = UNUserNotificationCenter.current()
-        let settings = await center.notificationSettings()
-        guard settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional else {
-            return
+        if hasBundleIdentifier {
+            let center = UNUserNotificationCenter.current()
+            let settings = await center.notificationSettings()
+            guard settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional else {
+                debugLog("[Notification] Skipped (not authorized, status=\(settings.authorizationStatus.rawValue)): \(title)")
+                return
+            }
+            debugLog("[Notification] Posting via UNUserNotificationCenter: \(title)")
+
+            let content = UNMutableNotificationContent()
+            content.title = title
+            content.body = body
+            content.sound = sound
+            if let logo = logoURL,
+               let attachment = try? UNNotificationAttachment(identifier: "logo", url: logo, options: nil) {
+                content.attachments = [attachment]
+            }
+
+            let request = UNNotificationRequest(
+                identifier: id,
+                content: content,
+                trigger: nil
+            )
+
+            try? await center.add(request)
+        } else {
+            // Fallback for dev builds without a bundle identifier
+            postViaOsascript(title: title, body: body)
         }
+    }
 
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = body
-        content.sound = sound
-
-        let request = UNNotificationRequest(
-            identifier: id,
-            content: content,
-            trigger: nil
-        )
-
-        try? await center.add(request)
+    /// Posts a notification using osascript as a fallback when UNUserNotificationCenter
+    /// is unavailable (no bundle identifier).
+    private static func postViaOsascript(title: String, body: String) {
+        let escaped = { (s: String) in s.replacingOccurrences(of: "\"", with: "\\\"") }
+        let script = "display notification \"\(escaped(body))\" with title \"\(escaped(title))\""
+        debugLog("[Notification] Posting via osascript: \(title)")
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", script]
+        try? process.run()
     }
 }

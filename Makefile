@@ -2,7 +2,10 @@ SWIFT = /usr/bin/swift
 BUILD_DIR = .build/arm64-apple-macosx/debug
 BINARY = $(BUILD_DIR)/ErrandDesktop
 ENTITLEMENTS = ErrandDesktop.entitlements
-RUN_DIR = /var/tmp/ErrandDesktop.app
+APP_BUNDLE = /var/tmp/ErrandDesktop.app
+CONTENTS = $(APP_BUNDLE)/Contents
+MACOS_DIR = $(CONTENTS)/MacOS
+RESOURCES_DIR = $(CONTENTS)/Resources
 
 .PHONY: all build sign run clean stop
 
@@ -14,14 +17,24 @@ build:
 sign: build
 	codesign --force --sign - --entitlements $(ENTITLEMENTS) $(BINARY)
 
-# Copy binary + all resource bundles to /var/tmp (vmnet workaround) and launch
+# Build a proper .app bundle in /var/tmp (vmnet workaround) and launch
 run: sign stop
-	@mkdir -p $(RUN_DIR)
-	@cp $(BINARY) $(RUN_DIR)/ErrandDesktop
-	@cp -R $(BUILD_DIR)/*.bundle $(RUN_DIR)/ 2>/dev/null || true
-	@codesign --force --sign - --entitlements $(ENTITLEMENTS) $(RUN_DIR)/ErrandDesktop
-	$(RUN_DIR)/ErrandDesktop &
-	@echo "Launched from $(RUN_DIR)"
+	@mkdir -p $(MACOS_DIR) $(RESOURCES_DIR)
+	@cp $(BINARY) $(MACOS_DIR)/ErrandDesktop
+	@cp -R $(BUILD_DIR)/*.bundle $(RESOURCES_DIR)/ 2>/dev/null || true
+	@cp Sources/ErrandDesktop/Resources/AppIcon.icns $(RESOURCES_DIR)/AppIcon.icns 2>/dev/null || true
+	@/usr/libexec/PlistBuddy -c "Delete :CFBundleIdentifier" $(CONTENTS)/Info.plist 2>/dev/null; \
+	 /usr/libexec/PlistBuddy \
+	   -c "Add :CFBundleIdentifier string sh.errand.ErrandDesktop" \
+	   -c "Add :CFBundleName string ErrandDesktop" \
+	   -c "Add :CFBundlePackageType string APPL" \
+	   -c "Add :CFBundleExecutable string ErrandDesktop" \
+	   -c "Add :CFBundleIconFile string AppIcon" \
+	   -c "Add :LSUIElement bool true" \
+	   $(CONTENTS)/Info.plist 2>/dev/null || true
+	@codesign --force --sign - --entitlements $(ENTITLEMENTS) $(APP_BUNDLE)
+	open $(APP_BUNDLE)
+	@echo "Launched from $(APP_BUNDLE)"
 
 stop:
 	@pkill -f ErrandDesktop 2>/dev/null || true
@@ -29,4 +42,4 @@ stop:
 
 clean:
 	$(SWIFT) package clean
-	rm -rf $(RUN_DIR)
+	rm -rf $(APP_BUNDLE)

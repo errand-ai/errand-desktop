@@ -57,6 +57,12 @@ actor ContainerEngine {
     /// LiteLLM master key from Keychain, used as the LiteLLM API key for all containers.
     var litellmMasterKey: String = ""
 
+    /// Scoped LiteLLM service key for Backend/Worker containers.
+    private(set) var errandServiceKey: String = ""
+
+    /// Scoped LiteLLM service key for Hindsight container.
+    private(set) var hindsightServiceKey: String = ""
+
     /// Background tasks streaming Docker container logs, keyed by container ID.
     private var logStreamTasks: [String: Task<Void, Never>] = [:]
 
@@ -73,6 +79,167 @@ actor ContainerEngine {
 
     func setLiteLLMMasterKey(_ key: String) {
         self.litellmMasterKey = key
+    }
+
+    // MARK: - Service Key Provisioning
+
+    /// Provisions scoped LiteLLM API keys for Backend/Worker (errand) and Hindsight.
+    /// Loads existing keys from Keychain, validates them against LiteLLM, and generates
+    /// new keys if missing or stale. Falls back to the master key on failure.
+    func provisionServiceKeys(config: AppConfig) async {
+        guard !litellmMasterKey.isEmpty else {
+            debugLog("[ContainerEngine] No master key set, skipping service key provisioning")
+            return
+        }
+
+        // Resolve LiteLLM base URL based on runtime
+        let litellmBaseURL: String
+        if isDockerRuntime {
+            litellmBaseURL = "http://localhost:\(config.litellmPort)"
+        } else {
+            // Apple Containerization: use container IP directly
+            guard let litellmContainerId = serviceContainerMap["litellm"] else {
+                debugLog("[ContainerEngine] LiteLLM container not found, falling back to master key")
+                errandServiceKey = litellmMasterKey
+                hindsightServiceKey = litellmMasterKey
+                return
+            }
+            if let rt = runtime, let ip = try? await rt.containerIP(id: litellmContainerId) {
+                litellmBaseURL = "http://\(ip):4000"
+            } else {
+                debugLog("[ContainerEngine] Could not resolve LiteLLM container IP, falling back to master key")
+                errandServiceKey = litellmMasterKey
+                hindsightServiceKey = litellmMasterKey
+                return
+            }
+        }
+
+        debugLog("[ContainerEngine] Provisioning service keys via \(litellmBaseURL)")
+
+        do {
+            errandServiceKey = try await provisionKey(
+                account: "litellm-errand-key",
+                alias: "errand-services",
+                metadata: ["purpose": "Backend and Worker LLM access"],
+                litellmBaseURL: litellmBaseURL
+            )
+        } catch {
+            debugLog("[ContainerEngine] Errand service key provisioning failed: \(error). Falling back to master key")
+            errandServiceKey = litellmMasterKey
+        }
+
+        do {
+            hindsightServiceKey = try await provisionKey(
+                account: "litellm-hindsight-key",
+                alias: "hindsight-services",
+                metadata: ["purpose": "Hindsight LLM and embedding access"],
+                litellmBaseURL: litellmBaseURL
+            )
+        } catch {
+            debugLog("[ContainerEngine] Hindsight service key provisioning failed: \(error). Falling back to master key")
+            hindsightServiceKey = litellmMasterKey
+        }
+
+        debugLog("[ContainerEngine] Service keys provisioned (errand=\(errandServiceKey == litellmMasterKey ? "master" : "scoped"), hindsight=\(hindsightServiceKey == litellmMasterKey ? "master" : "scoped"))")
+    }
+
+    /// Provisions a single service key: load from Keychain, validate, generate if needed.
+    private func provisionKey(
+        account: String,
+        alias: String,
+        metadata: [String: String],
+        litellmBaseURL: String
+    ) async throws -> String {
+        // Try loading from Keychain
+        if let existingKey = try KeychainManager.get(account: account) {
+            if await validateKey(existingKey, litellmBaseURL: litellmBaseURL) {
+                debugLog("[ContainerEngine] Key '\(alias)' loaded from Keychain and validated")
+                return existingKey
+            }
+            // Stale key — delete and regenerate
+            debugLog("[ContainerEngine] Key '\(alias)' is stale, regenerating")
+            try KeychainManager.delete(account: account)
+        }
+
+        // Generate new key with retries
+        let newKey = try await generateKey(
+            alias: alias,
+            metadata: metadata,
+            litellmBaseURL: litellmBaseURL
+        )
+        try KeychainManager.set(account: account, value: newKey)
+        debugLog("[ContainerEngine] Key '\(alias)' generated and stored in Keychain")
+        return newKey
+    }
+
+    /// Validates a key against LiteLLM via GET /key/info.
+    private func validateKey(_ key: String, litellmBaseURL: String) async -> Bool {
+        guard let url = URL(string: "\(litellmBaseURL)/key/info?key=\(key)") else { return false }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(litellmMasterKey)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 10
+
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            if let http = response as? HTTPURLResponse {
+                return (200..<300).contains(http.statusCode)
+            }
+            return false
+        } catch {
+            return false
+        }
+    }
+
+    /// Generates a new key via POST /key/generate with retry.
+    private func generateKey(
+        alias: String,
+        metadata: [String: String],
+        litellmBaseURL: String,
+        maxRetries: Int = 3
+    ) async throws -> String {
+        guard let url = URL(string: "\(litellmBaseURL)/key/generate") else {
+            throw ContainerEngineError.keyGenerationFailed("Invalid URL")
+        }
+
+        let body: [String: Any] = [
+            "key_alias": alias,
+            "key_type": "default",
+            "models": [] as [String],
+            "metadata": metadata,
+        ]
+        let bodyData = try JSONSerialization.data(withJSONObject: body)
+
+        for attempt in 1...maxRetries {
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("Bearer \(litellmMasterKey)", forHTTPHeaderField: "Authorization")
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = bodyData
+            request.timeoutInterval = 15
+
+            do {
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard let http = response as? HTTPURLResponse else {
+                    throw ContainerEngineError.keyGenerationFailed("No HTTP response")
+                }
+                guard (200..<300).contains(http.statusCode) else {
+                    let responseBody = String(data: data, encoding: .utf8) ?? ""
+                    throw ContainerEngineError.keyGenerationFailed("HTTP \(http.statusCode): \(responseBody)")
+                }
+
+                let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+                guard let key = json?["key"] as? String else {
+                    throw ContainerEngineError.keyGenerationFailed("No 'key' field in response")
+                }
+                return key
+            } catch where attempt < maxRetries {
+                debugLog("[ContainerEngine] Key generation attempt \(attempt)/\(maxRetries) failed: \(error). Retrying...")
+                try await Task.sleep(for: .seconds(2))
+            }
+        }
+
+        throw ContainerEngineError.keyGenerationFailed("All \(maxRetries) attempts failed")
     }
 
     // MARK: - Runtime Management
@@ -246,8 +413,10 @@ actor ContainerEngine {
         let images = imageSpecs(for: services, config: config)
 
         var skipServices = Set<String>()
-        if !config.useLiteLLM { skipServices.insert("litellm") }
+        if !config.deployLiteLLM { skipServices.insert("litellm") }
         if !config.useHindsight { skipServices.insert("hindsight") }
+        if !config.useGoogleDrive { skipServices.insert("gdrive-mcp") }
+        if !config.useOneDrive { skipServices.insert("onedrive-mcp") }
 
         let allServiceIds = serviceDependencies.keys.filter { !skipServices.contains($0) }
         var serviceIPs: [String: String] = [:]
@@ -265,29 +434,35 @@ actor ContainerEngine {
             }
         }
 
+        // Mark skipped services as resolved so dependency checks pass,
+        // but track them separately so they don't affect the loop termination count.
+        var resolved = Set<String>()
         for serviceId in skipServices {
-            completed.insert(serviceId)
+            resolved.insert(serviceId)
         }
 
-        while completed.count + failed.count < allServiceIds.count {
-            try Task.checkCancellation()
+        // Use an async stream to decouple task spawning from result collection.
+        // Each service runs as an unstructured Task, posts its result to the stream.
+        let (resultStream, resultContinuation) = AsyncStream<Result<(String, ServiceInfo), Error>>.makeStream()
+        var inFlight = Set<String>()
+
+        /// Spawns tasks for services whose dependencies are now satisfied.
+        func spawnReady() {
             let ready = allServiceIds.filter { id in
-                !completed.contains(id) && !failed.contains(id) &&
-                (serviceDependencies[id] ?? []).allSatisfy { completed.contains($0) }
+                !completed.contains(id) && !failed.contains(id) && !inFlight.contains(id) &&
+                (serviceDependencies[id] ?? []).allSatisfy { completed.contains($0) || resolved.contains($0) }
             }
+            for serviceId in ready {
+                guard let idx = services.firstIndex(where: { $0.id == serviceId }) else { continue }
+                guard let imageName = images[serviceId] else { continue }
 
-            guard !ready.isEmpty else { break }
+                inFlight.insert(serviceId)
+                let serviceSnapshot = services[idx]
+                let ipsSnapshot = serviceIPs
 
-            try await withThrowingTaskGroup(of: (String, ServiceInfo).self) { taskGroup in
-                for serviceId in ready {
-                    guard let idx = services.firstIndex(where: { $0.id == serviceId }) else { continue }
-                    guard let imageName = images[serviceId] else { continue }
-
-                    let serviceSnapshot = services[idx]
-                    let ipsSnapshot = serviceIPs
-
-                    taskGroup.addTask {
-                        return try await self.startSingleService(
+                Task {
+                    do {
+                        let result = try await self.startSingleService(
                             serviceId: serviceId,
                             service: serviceSnapshot,
                             imageName: imageName,
@@ -297,21 +472,48 @@ actor ContainerEngine {
                             onLog: onLog,
                             onPreparingProgress: onPreparingProgress
                         )
+                        resultContinuation.yield(.success(result))
+                    } catch {
+                        resultContinuation.yield(.failure(error))
                     }
                 }
+            }
+        }
 
-                for try await (serviceId, updatedService) in taskGroup {
-                    guard let idx = services.firstIndex(where: { $0.id == serviceId }) else { continue }
+        // Seed the initial batch of services with no dependencies.
+        spawnReady()
+
+        // As each service completes, immediately check if new services are unblocked.
+        for await result in resultStream {
+            switch result {
+            case .success(let (serviceId, updatedService)):
+                inFlight.remove(serviceId)
+                if let idx = services.firstIndex(where: { $0.id == serviceId }) {
                     services[idx] = updatedService
-                    if updatedService.status == .running || updatedService.status == .stopped {
-                        completed.insert(serviceId)
-                        if let ip = updatedService.containerIP {
-                            serviceIPs[serviceId] = ip
-                        }
-                    } else {
-                        failed.insert(serviceId)
-                    }
                 }
+                if updatedService.status == .running || updatedService.status == .stopped {
+                    completed.insert(serviceId)
+                    if let ip = updatedService.containerIP {
+                        serviceIPs[serviceId] = ip
+                    }
+                } else {
+                    failed.insert(serviceId)
+                }
+            case .failure(let error):
+                if let engineError = error as? ContainerEngineError,
+                   case .healthCheckTimeout(let serviceId) = engineError {
+                    inFlight.remove(serviceId)
+                    failed.insert(serviceId)
+                    debugLog("[ContainerEngine] Service \(serviceId) failed, continuing with remaining services")
+                }
+            }
+
+            // Spawn any services that are now unblocked by this completion.
+            spawnReady()
+
+            // If all services are done, close the stream.
+            if completed.count + failed.count >= allServiceIds.count {
+                resultContinuation.finish()
             }
         }
 
@@ -409,6 +611,9 @@ actor ContainerEngine {
                     await ensureDatabase("litellm", containerId: cid)
                     await ensureDatabase("hindsight", containerId: cid)
                     await ensureExtension("vector", database: "hindsight", containerId: cid)
+                }
+                if serviceId == "litellm", config.deployLiteLLM {
+                    await provisionServiceKeys(config: config)
                 }
                 service.status = .running
                 onStatus?(serviceId, .running, ip)
@@ -772,8 +977,8 @@ actor ContainerEngine {
         switch serviceId {
         case "litellm":    return 8 * 1024 * 1024 * 1024
         case "hindsight":  return 8 * 1024 * 1024 * 1024
+        case "playwright": return 4 * 1024 * 1024 * 1024
         case "backend":    return 4 * 1024 * 1024 * 1024
-        case "worker":     return 4 * 1024 * 1024 * 1024
         default:           return 2 * 1024 * 1024 * 1024
         }
     }
@@ -783,8 +988,8 @@ actor ContainerEngine {
         switch serviceId {
         case "litellm":    return 1_500_000_000
         case "hindsight":  return 3_000_000_000
+        case "playwright": return 1_500_000_000
         case "backend":    return   550_000_000
-        case "worker":     return   550_000_000
         case "migrate":    return   550_000_000
         case "postgres":   return   450_000_000
         case "valkey":     return    15_000_000
@@ -796,8 +1001,14 @@ actor ContainerEngine {
         switch serviceId {
         case "migrate":
             return ["alembic", "upgrade", "head"]
-        case "worker":
-            return ["python", "worker.py"]
+        case "playwright":
+            // Docker image has entrypoint that invokes the MCP server,
+            // so Cmd only provides arguments. Apple Containerization has no entrypoint
+            // mechanism, so needs the full command.
+            if isDockerRuntime {
+                return ["--isolated", "--port", "3000", "--host", "0.0.0.0", "--allowed-hosts", "*"]
+            }
+            return ["node", "/app/cli.js", "--isolated", "--port", "3000", "--host", "0.0.0.0", "--allowed-hosts", "*"]
         case "litellm":
             // Docker image has entrypoint (docker/prod_entrypoint.sh) that invokes litellm,
             // so Cmd only provides arguments. Apple Containerization has no entrypoint
@@ -820,12 +1031,18 @@ actor ContainerEngine {
                 images["postgres"] = "docker.io/pgvector/pgvector:pg16"
             case "valkey":
                 images["valkey"] = "docker.io/valkey/valkey:8-alpine"
-            case "backend", "worker", "migrate":
+            case "backend", "migrate":
                 images[service.id] = "ghcr.io/errand-ai/errand:\(config.contentManagerImageTag)"
             case "litellm":
                 images["litellm"] = "ghcr.io/berriai/litellm-database:main-v1.81.3-stable"
             case "hindsight":
-                images["hindsight"] = "ghcr.io/vectorize-io/hindsight:0.4.13-slim"
+                images["hindsight"] = "ghcr.io/vectorize-io/hindsight:0.4.13"
+            case "gdrive-mcp":
+                images["gdrive-mcp"] = "ghcr.io/devops-consultants/google-drive-mcp-server:latest"
+            case "onedrive-mcp":
+                images["onedrive-mcp"] = "ghcr.io/devops-consultants/one-drive-mcp-server:latest"
+            case "playwright":
+                images["playwright"] = "mcr.microsoft.com/playwright/mcp:latest"
             default:
                 break
             }
@@ -874,48 +1091,47 @@ actor ContainerEngine {
                 env["VALKEY_URL"] = "redis://\(vkHost):6379"
             }
             env["PORT"] = "\(config.backendPort)"
-            if let litellmHost = resolveHost("litellm"), config.useLiteLLM {
-                env["OPENAI_BASE_URL"] = "http://\(litellmHost):\(config.litellmPort)"
-                env["OPENAI_API_KEY"] = litellmMasterKey
-            } else if !config.openaiBaseURL.isEmpty {
-                env["OPENAI_BASE_URL"] = config.openaiBaseURL
-                env["OPENAI_API_KEY"] = config.openaiAPIKey
+            if let litellmHost = resolveHost("litellm"), config.deployLiteLLM {
+                env["LLM_PROVIDER_0_NAME"] = "LiteLLM"
+                env["LLM_PROVIDER_0_BASE_URL"] = "http://\(litellmHost):4000"
+                env["LLM_PROVIDER_0_API_KEY"] = errandServiceKey.isEmpty ? litellmMasterKey : errandServiceKey
+            } else if !config.llmProviderBaseURL.isEmpty {
+                env["LLM_PROVIDER_0_NAME"] = config.llmProviderName
+                env["LLM_PROVIDER_0_BASE_URL"] = config.llmProviderBaseURL
+                env["LLM_PROVIDER_0_API_KEY"] = config.llmProviderAPIKey
             }
             if !credentialEncryptionKey.isEmpty {
                 env["CREDENTIAL_ENCRYPTION_KEY"] = credentialEncryptionKey
             }
+            // Hindsight: HINDSIGHT_BASE_URL for server's own API calls,
+            // HINDSIGHT_URL + HINDSIGHT_BANK_ID for TaskManager to inject into task-runners
             if let hindsightHost = resolveHost("hindsight"), config.useHindsight {
                 env["HINDSIGHT_BASE_URL"] = "http://\(hindsightHost):8888"
-            }
-
-        case "worker":
-            if let pgHost = resolveHost("postgres") {
-                env["DATABASE_URL"] = "postgresql://postgres:postgres@\(pgHost):5432/errand"
-            }
-            if let vkHost = resolveHost("valkey") {
-                env["VALKEY_URL"] = "redis://\(vkHost):6379"
-            }
-            if let backendHost = resolveHost("backend") {
-                env["BACKEND_MCP_URL"] = "http://\(backendHost):\(config.backendPort)/mcp"
-            }
-            if let litellmHost = resolveHost("litellm"), config.useLiteLLM {
-                env["OPENAI_BASE_URL"] = "http://\(litellmHost):\(config.litellmPort)"
-                env["OPENAI_API_KEY"] = litellmMasterKey
-            } else if !config.openaiBaseURL.isEmpty {
-                env["OPENAI_BASE_URL"] = config.openaiBaseURL
-                env["OPENAI_API_KEY"] = config.openaiAPIKey
-            }
-            if !credentialEncryptionKey.isEmpty {
-                env["CREDENTIAL_ENCRYPTION_KEY"] = credentialEncryptionKey
-            }
-            if config.useHindsight, let hindsightHost = resolveHost("hindsight") {
                 env["HINDSIGHT_URL"] = "http://\(hindsightHost):8888/"
                 env["HINDSIGHT_BANK_ID"] = "errand-tasks"
             }
+            if let gdriveHost = resolveHost("gdrive-mcp"), config.useGoogleDrive {
+                env["GDRIVE_MCP_URL"] = "http://\(gdriveHost):8080/mcp"
+            }
+            if let onedriveHost = resolveHost("onedrive-mcp"), config.useOneDrive {
+                env["ONEDRIVE_MCP_URL"] = "http://\(onedriveHost):8080/mcp"
+            }
+            if let playwrightHost = resolveHost("playwright") {
+                env["PLAYWRIGHT_MCP_URL"] = "http://\(playwrightHost):3000/mcp"
+            }
+            // Task-runner management via Bridge API
             env["CONTAINER_RUNTIME"] = "apple"
             env["CONTAINER_BRIDGE_URL"] = "http://\(hostGatewayIP):\(bridgePort)"
             env["CONTAINER_BRIDGE_TOKEN"] = bridgeToken
             env["TASK_RUNNER_IMAGE"] = "ghcr.io/errand-ai/errand-task-runner:\(config.contentManagerImageTag)"
+            // Self-referencing URL for task-runners to call back to the server
+            if isDockerRuntime {
+                env["ERRAND_MCP_URL"] = "http://errand-backend:\(config.backendPort)/mcp"
+            } else if let backendIP = resolveHost("backend") {
+                env["ERRAND_MCP_URL"] = "http://\(backendIP):\(config.backendPort)/mcp"
+            }
+            // Telemetry
+            env["ERRAND_CONTAINER_RUNTIME"] = isDockerRuntime ? "apple-docker" : "apple-container"
 
         case "litellm":
             env["HOST"] = "0.0.0.0"
@@ -944,29 +1160,36 @@ actor ContainerEngine {
             env["HINDSIGHT_API_HOST"] = "0.0.0.0"
             env["HINDSIGHT_CP_HOSTNAME"] = "0.0.0.0"
             env["HINDSIGHT_CP_DATAPLANE_API_URL"] = "http://127.0.0.1:8888"
-            env["HINDSIGHT_API_LLM_PROVIDER"] = "openai"
-            env["HINDSIGHT_API_EMBEDDINGS_PROVIDER"] = "litellm"
-            env["HINDSIGHT_API_RERANKER_PROVIDER"] = "litellm"
-            env["HINDSIGHT_API_RERANKER_LITELLM_MODEL"] = "cohere/rerank-english-v3.0"
-            if let litellmHost = resolveHost("litellm"), config.useLiteLLM {
-                let litellmBase = "http://\(litellmHost):\(config.litellmPort)"
-                env["HINDSIGHT_API_LLM_BASE_URL"] = "\(litellmBase)/v1"
-                env["HINDSIGHT_API_LLM_API_KEY"] = litellmMasterKey
-                env["HINDSIGHT_API_LITELLM_API_BASE"] = litellmBase
-                env["HINDSIGHT_API_EMBEDDINGS_LITELLM_API_BASE"] = litellmBase
-                env["HINDSIGHT_API_EMBEDDINGS_LITELLM_API_KEY"] = litellmMasterKey
-            } else if !config.openaiBaseURL.isEmpty {
-                env["HINDSIGHT_API_LLM_BASE_URL"] = config.openaiBaseURL
-                env["HINDSIGHT_API_LLM_API_KEY"] = config.openaiAPIKey
-                env["HINDSIGHT_API_EMBEDDINGS_PROVIDER"] = "openai"
-                env["HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL"] = config.openaiBaseURL
-                env["HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY"] = config.openaiAPIKey
+            if let litellmHost = resolveHost("litellm"), config.deployLiteLLM {
+                let litellmBase = "http://\(litellmHost):4000"
+                let hKey = hindsightServiceKey.isEmpty ? litellmMasterKey : hindsightServiceKey
+                // LiteLLM exposes an OpenAI-compatible API
+                env["HINDSIGHT_API_LLM_PROVIDER"] = "openai"
+                env["HINDSIGHT_API_LLM_BASE_URL"] = litellmBase
+                env["HINDSIGHT_API_LLM_API_KEY"] = hKey
+                // Only configure embeddings/reranker via LiteLLM if user selected an embedding model;
+                // otherwise Hindsight uses its builtin embedding and rerank models.
+                if !config.hindsightEmbeddingModel.isEmpty {
+                    env["HINDSIGHT_API_EMBEDDINGS_PROVIDER"] = "openai"
+                    env["HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL"] = litellmBase
+                    env["HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY"] = hKey
+                    env["HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL"] = config.hindsightEmbeddingModel
+                    env["HINDSIGHT_API_RERANKER_PROVIDER"] = "flashrank"
+                }
+            } else if !config.llmProviderBaseURL.isEmpty {
+                env["HINDSIGHT_API_LLM_PROVIDER"] = "openai"
+                env["HINDSIGHT_API_LLM_BASE_URL"] = config.llmProviderBaseURL
+                env["HINDSIGHT_API_LLM_API_KEY"] = config.llmProviderAPIKey
+                if !config.hindsightEmbeddingModel.isEmpty {
+                    env["HINDSIGHT_API_EMBEDDINGS_PROVIDER"] = "openai"
+                    env["HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL"] = config.llmProviderBaseURL
+                    env["HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY"] = config.llmProviderAPIKey
+                    env["HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL"] = config.hindsightEmbeddingModel
+                    env["HINDSIGHT_API_RERANKER_PROVIDER"] = "flashrank"
+                }
             }
             if !config.hindsightLLMModel.isEmpty {
                 env["HINDSIGHT_API_LLM_MODEL"] = config.hindsightLLMModel
-            }
-            if !config.hindsightEmbeddingModel.isEmpty {
-                env["HINDSIGHT_API_EMBEDDINGS_LITELLM_MODEL"] = config.hindsightEmbeddingModel
             }
 
         default:
@@ -993,6 +1216,9 @@ actor ContainerEngine {
             if isDockerRuntime {
                 let dir = storageManager.dataPath(for: "valkey")
                 try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+                // Valkey 8 drops to uid 999 after entrypoint. On Colima/virtiofs, chown is
+                // a no-op so the directory must be world-writable. Harmless on Docker Desktop.
+                chmod(dir, 0o777)
                 return [dir: "/data"]
             } else {
                 let diskPath = (try? storageManager.ensureDataDisk(for: "valkey", sizeInMB: 256)) ?? ""
@@ -1017,7 +1243,8 @@ actor ContainerEngine {
         case "valkey": return [config.valkeyPort: 6379]
         case "backend": return [config.backendPort: 8000]
         case "litellm": return [config.litellmPort: 4000]
-        case "hindsight": return [config.hindsightPort: 8888]
+        case "hindsight": return [config.hindsightPort: 9999, 8888: 8888]
+        case "playwright": return [3000: 3000]
         default: return [:]
         }
     }
@@ -1084,9 +1311,18 @@ actor ContainerEngine {
         case "litellm":
             return await httpCheck(host: host, port: docker ? config.litellmPort : 4000, path: "/health/liveliness")
         case "hindsight":
-            return await httpCheck(host: host, port: docker ? config.hindsightPort : 8888, path: "/health")
-        case "worker":
-            return true
+            return await httpCheck(host: host, port: 8888, path: "/health")
+        case "gdrive-mcp", "onedrive-mcp":
+            // These services don't publish ports to the host — exec inside the container.
+            if let containerId = service.containerId {
+                return await execHealthCheck(containerId: containerId, command: [
+                    "python3", "-c",
+                    "import urllib.request; urllib.request.urlopen(\"http://localhost:8080/health\")"
+                ])
+            }
+            return false
+        case "playwright":
+            return await tcpCheck(host: host, port: 3000)
         default:
             return true
         }
@@ -1201,6 +1437,7 @@ enum ContainerEngineError: Error, LocalizedError {
     case outputNotFound(String)
     case kernelDownloadFailed
     case migrationFailed(exitCode: Int)
+    case keyGenerationFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -1216,6 +1453,8 @@ enum ContainerEngineError: Error, LocalizedError {
             "Failed to download Linux kernel binary"
         case .migrationFailed(let exitCode):
             "Database migration failed with exit code \(exitCode)"
+        case .keyGenerationFailed(let reason):
+            "LiteLLM key generation failed: \(reason)"
         }
     }
 }

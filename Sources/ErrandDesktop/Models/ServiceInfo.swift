@@ -21,8 +21,8 @@ enum AppStatus: String, Sendable {
 
 /// Represents a managed container service.
 struct ServiceInfo: Identifiable, Sendable {
-    let id: String          // e.g. "postgres", "valkey", "backend", "worker", "litellm", "migrate"
-    let displayName: String // e.g. "PostgreSQL", "Valkey", "Backend", "Worker", "LiteLLM", "Migrate"
+    let id: String          // e.g. "postgres", "valkey", "backend", "litellm", "migrate", "playwright"
+    let displayName: String // e.g. "PostgreSQL", "Valkey", "Backend", "LiteLLM", "Migrate", "Playwright"
     var status: ServiceStatus = .stopped
     var port: Int?          // localhost port for forwarding
     var containerPort: Int? // container-internal port, if different from `port`
@@ -38,11 +38,13 @@ struct ServiceInfo: Identifiable, Sendable {
 let serviceDependencies: [String: [String]] = [
     "postgres": [],
     "valkey": [],
+    "gdrive-mcp": [],
+    "onedrive-mcp": [],
+    "playwright": [],
     "migrate": ["postgres"],
     "litellm": ["postgres"],
-    "hindsight": ["litellm"],
-    "backend": ["migrate"],
-    "worker": ["backend"],
+    "hindsight": ["postgres", "litellm"],
+    "backend": ["migrate", "litellm"],
 ]
 
 /// Computes a reverse-topological shutdown order from the dependency graph.

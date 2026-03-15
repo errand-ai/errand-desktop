@@ -16,6 +16,9 @@ struct SettingsView: View {
             MemoryTab()
                 .environmentObject(appState)
                 .tabItem { Label("Memory", systemImage: "brain.head.profile") }
+            ServicesTab()
+                .environmentObject(appState)
+                .tabItem { Label("Services", systemImage: "square.stack.3d.up") }
             PortsTab()
                 .environmentObject(appState)
                 .tabItem { Label("Ports", systemImage: "network") }
@@ -131,7 +134,8 @@ private struct GeneralTab: View {
         do {
             availableTags = try await GHCRTagFetcher.fetchTags(
                 image: "errand-ai/errand",
-                includeBeta: appState.config.showBetaVersions
+                includeBeta: appState.config.showBetaVersions,
+                minimumVersion: "0.82.0"
             )
         } catch {
             print("[GeneralTab] Failed to fetch tags: \(error)")
@@ -143,24 +147,83 @@ private struct GeneralTab: View {
 
 private struct LLMTab: View {
     @EnvironmentObject var appState: AppState
+    @State private var isDetectingProvider = false
+    @State private var providerDetectionDone = false
 
     var body: some View {
         Form {
-            Toggle("Use LiteLLM", isOn: $appState.config.useLiteLLM)
-
-            LabeledContent("Base URL") {
-                TextField("", text: $appState.config.openaiBaseURL, prompt: Text("https://api.openai.com/v1"))
-                    .frame(width: 250)
-                    .disabled(appState.config.useLiteLLM)
+            // Radio choice
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: appState.config.deployLiteLLM ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(appState.config.deployLiteLLM ? Color.accentColor : Color.secondary)
+                Text("Deploy LiteLLM locally")
+                    .font(.headline)
+                Text("(Recommended)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
-            .opacity(appState.config.useLiteLLM ? 0.5 : 1.0)
+            .contentShape(Rectangle())
+            .onTapGesture { appState.config.deployLiteLLM = true }
 
-            LabeledContent("API Key") {
-                SecureField("", text: $appState.config.openaiAPIKey, prompt: Text("sk-...."))
-                    .frame(width: 250)
-                    .disabled(appState.config.useLiteLLM)
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: !appState.config.deployLiteLLM ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(!appState.config.deployLiteLLM ? Color.accentColor : Color.secondary)
+                Text("Connect to an existing provider")
+                    .font(.headline)
             }
-            .opacity(appState.config.useLiteLLM ? 0.5 : 1.0)
+            .contentShape(Rectangle())
+            .onTapGesture { appState.config.deployLiteLLM = false }
+
+            if !appState.config.deployLiteLLM {
+                LabeledContent("Name") {
+                    TextField("", text: $appState.config.llmProviderName, prompt: Text("e.g. OpenAI, Ollama"))
+                        .frame(width: 200)
+                }
+
+                LabeledContent("Base URL") {
+                    TextField("", text: $appState.config.llmProviderBaseURL, prompt: Text("https://api.openai.com/v1"))
+                        .frame(width: 200)
+                        .onChange(of: appState.config.llmProviderBaseURL) {
+                            providerDetectionDone = false
+                        }
+                }
+
+                LabeledContent("API Key") {
+                    SecureField("", text: $appState.config.llmProviderAPIKey, prompt: Text("sk-...."))
+                        .frame(width: 200)
+                        .onChange(of: appState.config.llmProviderAPIKey) {
+                            providerDetectionDone = false
+                        }
+                }
+
+                if isDetectingProvider {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("Detecting...").font(.caption).foregroundStyle(.secondary)
+                    }
+                } else if !appState.config.llmProviderType.isEmpty {
+                    HStack(spacing: 4) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.green).font(.caption)
+                        Text("Detected: \(providerTypeLabel(appState.config.llmProviderType))")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+
+                if !appState.config.llmProviderBaseURL.isEmpty && !appState.config.llmProviderAPIKey.isEmpty && !providerDetectionDone && !isDetectingProvider {
+                    Button("Detect Provider") {
+                        runDetection()
+                    }
+                    .font(.caption)
+                }
+            }
+
+            HStack(spacing: 2) {
+                Text("Learn more:")
+                    .font(.caption).foregroundStyle(.secondary)
+                Link("errand.sh/docs/ai-models/", destination: URL(string: "https://errand.sh/docs/ai-models/")!)
+                    .font(.caption)
+            }
 
             HStack {
                 Spacer()
@@ -168,6 +231,28 @@ private struct LLMTab: View {
             }
         }
         .padding()
+    }
+
+    private func runDetection() {
+        isDetectingProvider = true
+        providerDetectionDone = false
+        Task {
+            let result = await ProviderDetector.detect(
+                baseURL: appState.config.llmProviderBaseURL,
+                apiKey: appState.config.llmProviderAPIKey
+            )
+            appState.config.llmProviderType = result.rawValue
+            isDetectingProvider = false
+            providerDetectionDone = true
+        }
+    }
+
+    private func providerTypeLabel(_ type: String) -> String {
+        switch type {
+        case "litellm": return "LiteLLM"
+        case "openai_compatible": return "OpenAI-compatible"
+        default: return "Unknown provider"
+        }
     }
 }
 
@@ -179,44 +264,64 @@ private struct MemoryTab: View {
     @State private var embeddingModels: [AppState.ModelInfo] = []
     @State private var isLoadingModels = false
 
+    private var providerType: ProviderType {
+        if appState.config.deployLiteLLM { return .litellm }
+        return ProviderType(rawValue: appState.config.llmProviderType) ?? .unknown
+    }
+
     var body: some View {
         Form {
             Toggle("Use Hindsight for Agent Memory", isOn: $appState.config.useHindsight)
 
-            LabeledContent("LLM Model") {
-                Picker("", selection: $appState.config.hindsightLLMModel) {
-                    Text("Select a model").tag("")
-                    ForEach(chatModels) { model in
-                        Text(model.id).tag(model.id)
-                    }
-                    // Keep current value visible even if not yet in fetched list
-                    if !appState.config.hindsightLLMModel.isEmpty,
-                       !chatModels.contains(where: { $0.id == appState.config.hindsightLLMModel }) {
-                        Text(appState.config.hindsightLLMModel).tag(appState.config.hindsightLLMModel)
-                    }
+            if providerType == .unknown {
+                LabeledContent("LLM Model") {
+                    TextField("", text: $appState.config.hindsightLLMModel, prompt: Text("e.g. gpt-4o"))
+                        .frame(width: 250)
+                        .disabled(!appState.config.useHindsight)
                 }
-                .labelsHidden()
-                .frame(width: 250)
-                .disabled(!appState.config.useHindsight)
-            }
-            .opacity(appState.config.useHindsight ? 1.0 : 0.5)
+                .opacity(appState.config.useHindsight ? 1.0 : 0.5)
 
-            LabeledContent("Embedding Model") {
-                Picker("", selection: $appState.config.hindsightEmbeddingModel) {
-                    Text("Select a model").tag("")
-                    ForEach(embeddingModels) { model in
-                        Text(model.id).tag(model.id)
-                    }
-                    if !appState.config.hindsightEmbeddingModel.isEmpty,
-                       !embeddingModels.contains(where: { $0.id == appState.config.hindsightEmbeddingModel }) {
-                        Text(appState.config.hindsightEmbeddingModel).tag(appState.config.hindsightEmbeddingModel)
-                    }
+                LabeledContent("Embedding Model") {
+                    TextField("", text: $appState.config.hindsightEmbeddingModel, prompt: Text("e.g. text-embedding-3-small"))
+                        .frame(width: 250)
+                        .disabled(!appState.config.useHindsight)
                 }
-                .labelsHidden()
-                .frame(width: 250)
-                .disabled(!appState.config.useHindsight)
+                .opacity(appState.config.useHindsight ? 1.0 : 0.5)
+            } else {
+                LabeledContent("LLM Model") {
+                    Picker("", selection: $appState.config.hindsightLLMModel) {
+                        Text("Select a model").tag("")
+                        ForEach(chatModels) { model in
+                            Text(model.id).tag(model.id)
+                        }
+                        if !appState.config.hindsightLLMModel.isEmpty,
+                           !chatModels.contains(where: { $0.id == appState.config.hindsightLLMModel }) {
+                            Text(appState.config.hindsightLLMModel).tag(appState.config.hindsightLLMModel)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 250)
+                    .disabled(!appState.config.useHindsight)
+                }
+                .opacity(appState.config.useHindsight ? 1.0 : 0.5)
+
+                LabeledContent("Embedding Model") {
+                    Picker("", selection: $appState.config.hindsightEmbeddingModel) {
+                        Text("Select a model").tag("")
+                        ForEach(embeddingModels) { model in
+                            Text(model.id).tag(model.id)
+                        }
+                        if !appState.config.hindsightEmbeddingModel.isEmpty,
+                           !embeddingModels.contains(where: { $0.id == appState.config.hindsightEmbeddingModel }) {
+                            Text(appState.config.hindsightEmbeddingModel).tag(appState.config.hindsightEmbeddingModel)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 250)
+                    .disabled(!appState.config.useHindsight)
+                }
+                .opacity(appState.config.useHindsight ? 1.0 : 0.5)
             }
-            .opacity(appState.config.useHindsight ? 1.0 : 0.5)
 
             if isLoadingModels {
                 HStack {
@@ -227,6 +332,13 @@ private struct MemoryTab: View {
                 }
             }
 
+            HStack(spacing: 2) {
+                Text("Learn more:")
+                    .font(.caption).foregroundStyle(.secondary)
+                Link("errand.sh/docs/ai-memory/", destination: URL(string: "https://errand.sh/docs/ai-memory/")!)
+                    .font(.caption)
+            }
+
             HStack {
                 Spacer()
                 Button("Save") { appState.saveConfig() }
@@ -234,11 +346,11 @@ private struct MemoryTab: View {
         }
         .padding()
         .task {
-            guard appState.config.useHindsight else { return }
+            guard appState.config.useHindsight, providerType != .unknown else { return }
             await loadModels()
         }
         .onChange(of: appState.config.useHindsight) { _, enabled in
-            if enabled {
+            if enabled && providerType != .unknown {
                 Task { await loadModels() }
             }
         }
@@ -250,6 +362,31 @@ private struct MemoryTab: View {
         chatModels = chat
         embeddingModels = embedding
         isLoadingModels = false
+    }
+}
+
+// MARK: - Services
+
+private struct ServicesTab: View {
+    @EnvironmentObject var appState: AppState
+
+    var body: some View {
+        Form {
+            Section("Cloud Storage") {
+                Toggle("Google Drive MCP Server", isOn: $appState.config.useGoogleDrive)
+                Toggle("OneDrive MCP Server", isOn: $appState.config.useOneDrive)
+
+                Text("Enables agents to access cloud storage files. OAuth credentials must be configured in the Errand backend Settings > Integrations page.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack {
+                Spacer()
+                Button("Save") { appState.saveConfig() }
+            }
+        }
+        .padding()
     }
 }
 

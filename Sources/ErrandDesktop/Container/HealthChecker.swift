@@ -37,7 +37,7 @@ class HealthChecker {
     private func checkAll() async {
         for i in appState.services.indices {
             let service = appState.services[i]
-            guard service.status == .running, !service.isEphemeral else { continue }
+            guard service.status == .running || service.status == .error, !service.isEphemeral else { continue }
 
             // Fast path: if the container process has exited, mark it immediately
             if await containerEngine.hasExited(serviceId: service.id) {
@@ -65,14 +65,20 @@ class HealthChecker {
                 let port = isDocker ? appState.config.litellmPort : 4000
                 healthy = await httpCheck(host: host, port: port, path: "/health/liveliness")
             case "hindsight":
-                let port = isDocker ? appState.config.hindsightPort : 8888
-                healthy = await httpCheck(host: host, port: port, path: "/health")
+                // API serves /health on port 8888; hindsightPort (9999) is the Control Plane UI
+                healthy = await httpCheck(host: host, port: 8888, path: "/health")
             default:
                 continue
             }
 
             if healthy {
                 appState.services[i].healthCheckFailures = 0
+                if service.status == .error {
+                    appState.services[i].status = .running
+                    appState.appendLog(service: service.id, message: "\(service.displayName) recovered and is now healthy")
+                    let displayName = service.displayName
+                    Task { await NotificationManager.postServiceStarted(displayName) }
+                }
             } else {
                 appState.services[i].healthCheckFailures += 1
                 if appState.services[i].healthCheckFailures >= maxFailures {

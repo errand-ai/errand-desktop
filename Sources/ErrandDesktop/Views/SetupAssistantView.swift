@@ -16,16 +16,18 @@ struct SetupAssistantView: View {
     @State private var isLoadingTags = false
     @State private var tagFetchError = false
     @State private var isCheckingDocker = false
+    @State private var isDetectingProvider = false
+    @State private var providerDetectionDone = false
 
     // Steps: 0=Welcome, 1=Runtime, 2=LLM Config, 3=LLM Start, 4=Agent Memory, 5=Version, 6=Image Pull, 7=Done
     private let totalSteps = 8
 
     var body: some View {
         VStack(spacing: 0) {
-            // Step indicators — hide the LLM Start dot (step 3) when LiteLLM is off
+            // Step indicators — hide the LLM Start dot (step 3) when not deploying LiteLLM locally
             HStack(spacing: 8) {
                 ForEach(0..<totalSteps, id: \.self) { i in
-                    if i != 3 || appState.config.useLiteLLM {
+                    if i != 3 || appState.config.deployLiteLLM {
                         Circle()
                             .fill(i <= step ? Color.accentColor : Color.secondary.opacity(0.3))
                             .frame(width: 8, height: 8)
@@ -57,7 +59,7 @@ struct SetupAssistantView: View {
             HStack {
                 if step > 0 && step < totalSteps - 1 {
                     Button("Back") {
-                        if step == 4 && !appState.config.useLiteLLM {
+                        if step == 4 && !appState.config.deployLiteLLM {
                             step = 2  // Skip back over LLM Start step
                         } else {
                             step -= 1
@@ -70,7 +72,7 @@ struct SetupAssistantView: View {
 
                 if step < totalSteps - 1 {
                     Button("Continue") {
-                        if step == 2 && !appState.config.useLiteLLM {
+                        if step == 2 && !appState.config.deployLiteLLM {
                             step = 4  // Skip LLM Start step
                         } else {
                             step += 1
@@ -216,34 +218,139 @@ struct SetupAssistantView: View {
 
     private var llmConfigStep: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("LLM Configuration")
+            Text("LLM Provider")
                 .font(.title2.weight(.semibold))
 
-            Toggle("Use LiteLLM", isOn: $appState.config.useLiteLLM)
+            Text("Errand needs access to an LLM provider for AI tasks.")
+                .foregroundStyle(.secondary)
 
-            if appState.config.useLiteLLM {
-                Text("LiteLLM provides a unified proxy for multiple LLM providers. Postgres and LiteLLM containers will be started on the next step.")
+            // Radio choice
+            VStack(alignment: .leading, spacing: 12) {
+                radioRow(
+                    selected: appState.config.deployLiteLLM,
+                    title: "Deploy LiteLLM locally",
+                    subtitle: "Route requests through a local LiteLLM proxy that supports multiple AI providers.",
+                    recommended: true
+                ) {
+                    appState.config.deployLiteLLM = true
+                }
+
+                radioRow(
+                    selected: !appState.config.deployLiteLLM,
+                    title: "Connect to an existing provider",
+                    subtitle: "Provide the Base URL and API key for an OpenAI-compatible API endpoint.",
+                    recommended: false
+                ) {
+                    appState.config.deployLiteLLM = false
+                }
+            }
+
+            if !appState.config.deployLiteLLM {
+                Form {
+                    LabeledContent("Name") {
+                        TextField("", text: $appState.config.llmProviderName, prompt: Text("e.g. OpenAI, Ollama"))
+                            .frame(width: 250)
+                    }
+
+                    LabeledContent("Base URL") {
+                        TextField("", text: $appState.config.llmProviderBaseURL, prompt: Text("https://api.openai.com/v1"))
+                            .frame(width: 250)
+                            .onChange(of: appState.config.llmProviderBaseURL) {
+                                providerDetectionDone = false
+                            }
+                    }
+
+                    LabeledContent("API Key") {
+                        SecureField("", text: $appState.config.llmProviderAPIKey, prompt: Text("sk-...."))
+                            .frame(width: 250)
+                            .onChange(of: appState.config.llmProviderAPIKey) {
+                                providerDetectionDone = false
+                            }
+                    }
+                }
+
+                if isDetectingProvider {
+                    HStack(spacing: 6) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Detecting provider type...")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } else if providerDetectionDone, !appState.config.llmProviderType.isEmpty {
+                    let label = providerTypeLabel(appState.config.llmProviderType)
+                    HStack(spacing: 4) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                            .font(.caption)
+                        Text("Detected: \(label)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if !appState.config.llmProviderBaseURL.isEmpty && !appState.config.llmProviderAPIKey.isEmpty && !providerDetectionDone && !isDetectingProvider {
+                    Button("Detect Provider") {
+                        runProviderDetection()
+                    }
+                    .font(.caption)
+                }
+            }
+
+            HStack(spacing: 2) {
+                Text("Learn more:")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-            } else {
-                Text("Enter your OpenAI-compatible API credentials.")
+                Link("errand.sh/docs/ai-models/", destination: URL(string: "https://errand.sh/docs/ai-models/")!)
+                    .font(.caption)
+            }
+        }
+    }
+
+    private func radioRow(selected: Bool, title: String, subtitle: String, recommended: Bool, action: @escaping () -> Void) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                .foregroundStyle(selected ? Color.accentColor : Color.secondary)
+                .font(.title3)
+
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(title)
+                        .font(.headline)
+                    if recommended {
+                        Text("(Recommended)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Text(subtitle)
+                    .font(.caption)
                     .foregroundStyle(.secondary)
             }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture(perform: action)
+    }
 
-            Form {
-                LabeledContent("Base URL") {
-                    TextField("", text: $appState.config.openaiBaseURL, prompt: Text("https://api.openai.com/v1"))
-                        .frame(width: 250)
-                        .disabled(appState.config.useLiteLLM)
-                }
+    private func runProviderDetection() {
+        isDetectingProvider = true
+        providerDetectionDone = false
+        Task {
+            let result = await ProviderDetector.detect(
+                baseURL: appState.config.llmProviderBaseURL,
+                apiKey: appState.config.llmProviderAPIKey
+            )
+            appState.config.llmProviderType = result.rawValue
+            isDetectingProvider = false
+            providerDetectionDone = true
+        }
+    }
 
-                LabeledContent("API Key") {
-                    SecureField("", text: $appState.config.openaiAPIKey, prompt: Text("sk-...."))
-                        .frame(width: 250)
-                        .disabled(appState.config.useLiteLLM)
-                }
-            }
-            .opacity(appState.config.useLiteLLM ? 0.5 : 1.0)
+    private func providerTypeLabel(_ type: String) -> String {
+        switch type {
+        case "litellm": return "LiteLLM"
+        case "openai_compatible": return "OpenAI-compatible"
+        default: return "Unknown provider"
         }
     }
 
@@ -376,9 +483,14 @@ struct SetupAssistantView: View {
     }
 
     private var agentMemoryStep: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        let providerType = effectiveProviderType
+
+        return VStack(alignment: .leading, spacing: 16) {
             Text("Agent Memory")
                 .font(.title2.weight(.semibold))
+
+            Text("Hindsight gives your AI agents persistent memory across tasks and conversations.")
+                .foregroundStyle(.secondary)
 
             Toggle("Use Hindsight for Agent Memory", isOn: $appState.config.useHindsight)
 
@@ -405,36 +517,77 @@ struct SetupAssistantView: View {
             }
 
             Form {
-                LabeledContent("LLM Model") {
-                    Picker("", selection: $appState.config.hindsightLLMModel) {
-                        Text("Select a model").tag("")
-                        ForEach(chatModels) { model in
-                            Text(model.id).tag(model.id)
-                        }
+                if providerType == .unknown {
+                    LabeledContent("LLM Model") {
+                        TextField("", text: $appState.config.hindsightLLMModel, prompt: Text("e.g. gpt-4o"))
+                            .frame(width: 250)
+                            .disabled(!appState.config.useHindsight)
                     }
-                    .labelsHidden()
-                    .frame(width: 250)
-                    .disabled(!appState.config.useHindsight)
-                }
 
-                LabeledContent("Embedding Model") {
-                    Picker("", selection: $appState.config.hindsightEmbeddingModel) {
-                        Text("Select a model").tag("")
-                        ForEach(embeddingModels) { model in
-                            Text(model.id).tag(model.id)
-                        }
+                    LabeledContent("Embedding Model") {
+                        TextField("", text: $appState.config.hindsightEmbeddingModel, prompt: Text("e.g. text-embedding-3-small"))
+                            .frame(width: 250)
+                            .disabled(!appState.config.useHindsight)
                     }
-                    .labelsHidden()
-                    .frame(width: 250)
-                    .disabled(!appState.config.useHindsight)
+                } else {
+                    LabeledContent("LLM Model") {
+                        Picker("", selection: $appState.config.hindsightLLMModel) {
+                            Text("Select a model").tag("")
+                            ForEach(chatModels) { model in
+                                Text(model.id).tag(model.id)
+                            }
+                        }
+                        .labelsHidden()
+                        .frame(width: 250)
+                        .disabled(!appState.config.useHindsight)
+                    }
+
+                    LabeledContent("Embedding Model") {
+                        Picker("", selection: $appState.config.hindsightEmbeddingModel) {
+                            Text("Select a model").tag("")
+                            ForEach(embeddingModels) { model in
+                                Text(model.id).tag(model.id)
+                            }
+                        }
+                        .labelsHidden()
+                        .frame(width: 250)
+                        .disabled(!appState.config.useHindsight)
+                    }
                 }
             }
             .opacity(appState.config.useHindsight ? 1.0 : 0.5)
+
+            HStack(spacing: 2) {
+                Text("Learn more:")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Link("errand.sh/docs/ai-memory/", destination: URL(string: "https://errand.sh/docs/ai-memory/")!)
+                    .font(.caption)
+            }
         }
         .task(id: appState.config.useHindsight) {
             guard appState.config.useHindsight else { return }
             fetchModels()
         }
+    }
+
+    /// Services to show in the image pull step, excluding disabled ones.
+    private var visibleServices: [ServiceInfo] {
+        appState.services.filter { service in
+            if service.id == "litellm" && !appState.config.deployLiteLLM { return false }
+            if service.id == "hindsight" && !appState.config.useHindsight { return false }
+            if service.id == "gdrive-mcp" && !appState.config.useGoogleDrive { return false }
+            if service.id == "onedrive-mcp" && !appState.config.useOneDrive { return false }
+            return true
+        }
+    }
+
+    /// The effective provider type — litellm if deploying locally, otherwise from config.
+    private var effectiveProviderType: ProviderType {
+        if appState.config.deployLiteLLM {
+            return .litellm
+        }
+        return ProviderType(rawValue: appState.config.llmProviderType) ?? .unknown
     }
 
     private func fetchModels() {
@@ -519,7 +672,8 @@ struct SetupAssistantView: View {
             do {
                 var tags = try await GHCRTagFetcher.fetchTags(
                     image: "errand-ai/errand",
-                    includeBeta: appState.config.showBetaVersions
+                    includeBeta: appState.config.showBetaVersions,
+                    minimumVersion: "0.82.0"
                 )
                 // Remove "latest" unless it's an actual tag returned from GHCR
                 // (GHCRTagFetcher already filters and sorts by semver descending)
@@ -548,7 +702,7 @@ struct SetupAssistantView: View {
                 .foregroundStyle(.secondary)
 
             VStack(spacing: 10) {
-                ForEach(appState.services) { service in
+                ForEach(visibleServices) { service in
                     let progress = appState.imagePullProgress[service.id] ?? 0
 
                     HStack {
@@ -584,7 +738,7 @@ struct SetupAssistantView: View {
             Text("You're All Set!")
                 .font(.title2.weight(.semibold))
 
-            Text("Click the menu bar icon to start your services.")
+            Text("Your services are starting up now. Click the menu bar icon to see their status.")
                 .foregroundStyle(.secondary)
         }
     }

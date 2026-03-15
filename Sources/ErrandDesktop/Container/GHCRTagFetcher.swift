@@ -7,8 +7,9 @@ enum GHCRTagFetcher {
     /// - Parameters:
     ///   - image: The image path (e.g. "errand-ai/errand")
     ///   - includeBeta: When true, include PR build tags (e.g. "0.50.0-pr55")
+    ///   - minimumVersion: When set, only include tags >= this version (e.g. "0.82.0")
     /// - Returns: Sorted array of tag strings, newest first
-    static func fetchTags(image: String, includeBeta: Bool = false) async throws -> [String] {
+    static func fetchTags(image: String, includeBeta: Bool = false, minimumVersion: String? = nil) async throws -> [String] {
         // Step 1: Get anonymous bearer token
         let tokenURL = URL(string: "https://ghcr.io/token?scope=repository:\(image):pull&service=ghcr.io")!
         let (tokenData, _) = try await URLSession.shared.data(from: tokenURL)
@@ -18,7 +19,7 @@ enum GHCRTagFetcher {
         }
 
         // Step 2: List tags
-        var request = URLRequest(url: URL(string: "https://ghcr.io/v2/\(image)/tags/list")!)
+        var request = URLRequest(url: URL(string: "https://ghcr.io/v2/\(image)/tags/list?n=1000")!)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         let (tagsData, _) = try await URLSession.shared.data(for: request)
         let tagsResponse = try JSONDecoder().decode(TagsResponse.self, from: tagsData)
@@ -27,6 +28,11 @@ enum GHCRTagFetcher {
         let tags = tagsResponse.tags ?? []
         return tags
             .filter { includeBeta || !$0.contains("-pr") }
+            .filter { tag in
+                guard let min = minimumVersion else { return true }
+                // Keep tags >= minimumVersion (semverCompare returns true if $0 > $1)
+                return tag == min || semverCompare(tag, min)
+            }
             .sorted { semverCompare($0, $1) }
     }
 

@@ -119,9 +119,19 @@ struct MenuBarPopover: View {
         }
     }
 
+    private var visibleServices: [ServiceInfo] {
+        appState.services.filter { service in
+            if service.id == "litellm" && !appState.config.deployLiteLLM { return false }
+            if service.id == "hindsight" && !appState.config.useHindsight { return false }
+            if service.id == "gdrive-mcp" && !appState.config.useGoogleDrive { return false }
+            if service.id == "onedrive-mcp" && !appState.config.useOneDrive { return false }
+            return true
+        }
+    }
+
     private var serviceList: some View {
         VStack(spacing: 2) {
-            ForEach(appState.services) { service in
+            ForEach(visibleServices) { service in
                 HStack {
                     Circle()
                         .fill(service.status.color)
