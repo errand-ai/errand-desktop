@@ -23,6 +23,7 @@ class AppState: ObservableObject {
     @Published var migrationError: String?
     @Published var keychainError: String?
     @Published var runtimeError: String?
+    @Published var litellmMasterKeyDisplay: String = ""
     @Published var imagePullProgress: [String: Double] = [:]
     @Published var availableRuntimes: [RuntimeCapability] = []
     @Published var activeRuntime: RuntimeCapability?
@@ -94,11 +95,11 @@ class AppState: ObservableObject {
         // Request notification authorization early
         await NotificationManager.requestAuthorization()
 
-        // On first run, skip keychain/auto-start — the setup wizard handles initial configuration.
-        guard !isFirstRun else { return }
-
-        // Load secrets from the macOS Keychain with retry (keychain may be locked briefly after login)
+        // Load secrets from the macOS Keychain (needed for both setup wizard and normal startup)
         await loadKeychainSecrets()
+
+        // On first run, stop here — the setup wizard handles the rest.
+        guard !isFirstRun else { return }
 
         // Load persisted LiteLLM providers
         await liteLLMManager?.loadProviders()
@@ -171,6 +172,7 @@ class AppState: ObservableObject {
                 let masterKey = try KeychainManager.getOrCreateLiteLLMKey()
                 await containerEngine?.setCredentialEncryptionKey(encKey)
                 await containerEngine?.setLiteLLMMasterKey(masterKey)
+                litellmMasterKeyDisplay = masterKey
                 appendLog(service: "system", message: "Keychain secrets loaded successfully")
                 return
             } catch {
@@ -490,12 +492,7 @@ class AppState: ObservableObject {
         if config.deployLiteLLM {
             providerType = .litellm
             baseURL = "http://localhost:\(config.litellmPort)"
-            do {
-                apiKey = try KeychainManager.getOrCreateLiteLLMKey()
-            } catch {
-                appendLog(service: "system", message: "Failed to get LiteLLM key: \(error.localizedDescription)")
-                return ([], [])
-            }
+            apiKey = litellmMasterKeyDisplay
         } else {
             providerType = ProviderType(rawValue: config.llmProviderType) ?? .unknown
             baseURL = config.llmProviderBaseURL

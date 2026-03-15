@@ -1,11 +1,26 @@
 import Foundation
 import Security
 
-/// Manages secrets in the macOS Keychain.
+/// Manages secrets in the macOS Keychain with a file-based fallback.
+///
+/// Ad-hoc signed development builds get a new code identity on every build,
+/// making keychain items inaccessible across rebuilds. To avoid regenerating
+/// keys (which would invalidate LiteLLM's encrypted database), secrets are
+/// also cached in a local file. The file is the primary store; the keychain
+/// provides additional OS-level protection for production (Developer ID) builds.
 enum KeychainManager {
 
     private static let service = "sh.errand.ErrandDesktop"
-    /// Base query attributes shared by all operations.
+
+    /// Directory for the file-based secret cache.
+    private static var secretsDir: String {
+        let base = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/ErrandDesktop")
+            .path
+        return base + "/secrets"
+    }
+
+    /// Base query attributes shared by all keychain operations.
     private static func baseQuery(account: String) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
@@ -14,7 +29,9 @@ enum KeychainManager {
         ]
     }
 
-    /// Retrieves a value from the Keychain, or creates and stores a new random one.
+    // MARK: - Public API
+
+    /// Retrieves a value, or creates and stores a new random one.
     static func getOrCreate(account: String, bytesCount: Int = 32) throws -> String {
         if let existing = try get(account: account) {
             return existing
@@ -34,8 +51,14 @@ enum KeychainManager {
         return key
     }
 
-    /// Retrieves a Keychain item by account name. Returns nil if not found.
+    /// Retrieves a secret by account name. Returns nil if not found.
     static func get(account: String) throws -> String? {
+        // Try the file cache first (immune to code signature changes).
+        if let value = readFromFile(account: account) {
+            return value
+        }
+
+        // Fall back to keychain (works for production builds with stable signatures).
         var query = baseQuery(account: account)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -44,74 +67,53 @@ enum KeychainManager {
         let status = SecItemCopyMatching(query as CFDictionary, &result)
 
         if status == errSecItemNotFound || status == errSecInteractionNotAllowed {
-            // errSecInteractionNotAllowed: item exists but belongs to a different
-            // code signature and macOS won't prompt for access. Treat as not found
-            // so getOrCreate() will delete and recreate it.
             return nil
         }
         guard status == errSecSuccess, let data = result as? Data,
               let value = String(data: data, encoding: .utf8) else {
             throw KeychainError.unhandledError(status: status)
         }
+
+        // Backfill the file cache so future reads survive signature changes.
+        writeToFile(account: account, value: value)
         return value
     }
 
-    /// Stores a value in the Keychain. Overwrites if the account already exists.
+    /// Stores a secret. Writes to both the file cache and the keychain.
     static func set(account: String, value: String) throws {
+        // Always write to the file cache.
+        writeToFile(account: account, value: value)
+
+        // Best-effort write to the keychain.
         guard let data = value.data(using: .utf8) else { return }
-
         let query = baseQuery(account: account)
-
-        // Delete any existing item first to avoid errSecDuplicateItem from stale
-        // items left by a previous code signature.
         SecItemDelete(query as CFDictionary)
 
         var addQuery = query
         addQuery[kSecValueData as String] = data
         addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
-        var addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
 
         if addStatus == errSecDuplicateItem || addStatus == errSecInteractionNotAllowed {
-            // Item exists but belongs to a different code signature.
-            // The Security framework can't delete/update it, but the `security` CLI can.
+            // Old item from a different signature blocks us. Delete via CLI and retry.
             shellDeleteKeychainItem(service: service, account: account)
-
-            // Retry the add after shell deletion.
-            addStatus = SecItemAdd(addQuery as CFDictionary, nil)
-        }
-
-        guard addStatus == errSecSuccess else {
-            throw KeychainError.unhandledError(status: addStatus)
+            SecItemAdd(addQuery as CFDictionary, nil)
+            // Ignore errors — the file cache is the authoritative store.
         }
     }
 
-    /// Deletes a keychain item using the `security` CLI tool, which can remove items
-    /// regardless of code signature ACLs.
-    private static func shellDeleteKeychainItem(service: String, account: String) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        process.arguments = [
-            "delete-generic-password",
-            "-s", service,
-            "-a", account,
-            "login.keychain-db"
-        ]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        try? process.run()
-        process.waitUntilExit()
-    }
-
-    /// Deletes a Keychain item by account name.
+    /// Deletes a secret from both stores.
     static func delete(account: String) throws {
+        deleteFile(account: account)
         let query = baseQuery(account: account)
         let status = SecItemDelete(query as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else {
+        if status != errSecSuccess && status != errSecItemNotFound
+            && status != errSecInteractionNotAllowed {
             throw KeychainError.unhandledError(status: status)
         }
     }
 
-    // MARK: - Private
+    // MARK: - Key Generation
 
     private static func generateRandomKey(bytesCount: Int) -> String {
         var bytes = [UInt8](repeating: 0, count: bytesCount)
@@ -126,6 +128,55 @@ enum KeychainManager {
         _ = SecRandomCopyBytes(kSecRandomDefault, 18, &bytes)
         let suffix = String(bytes.map { chars[Int($0) % chars.count] })
         return "sk-\(suffix)"
+    }
+
+    // MARK: - File Cache
+
+    private static func filePath(account: String) -> String {
+        secretsDir + "/" + account
+    }
+
+    private static func readFromFile(account: String) -> String? {
+        guard let data = FileManager.default.contents(atPath: filePath(account: account)),
+              let value = String(data: data, encoding: .utf8) else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func writeToFile(account: String, value: String) {
+        let dir = secretsDir
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        // Restrict permissions: owner read/write only.
+        try? value.write(toFile: filePath(account: account), atomically: true, encoding: .utf8)
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: filePath(account: account)
+        )
+    }
+
+    private static func deleteFile(account: String) {
+        try? FileManager.default.removeItem(atPath: filePath(account: account))
+    }
+
+    // MARK: - Shell Helpers
+
+    /// Deletes all keychain items matching the service+account using the `security` CLI tool.
+    private static func shellDeleteKeychainItem(service: String, account: String) {
+        for _ in 0..<10 {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+            process.arguments = [
+                "delete-generic-password",
+                "-s", service,
+                "-a", account,
+                "login.keychain-db"
+            ]
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            try? process.run()
+            process.waitUntilExit()
+            if process.terminationStatus != 0 { break }
+        }
     }
 }
 

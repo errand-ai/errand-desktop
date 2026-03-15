@@ -436,7 +436,8 @@ struct SetupAssistantView: View {
                         }
                     }
 
-                    if let masterKey = try? KeychainManager.getOrCreateLiteLLMKey() {
+                    if !appState.litellmMasterKeyDisplay.isEmpty {
+                        let masterKey = appState.litellmMasterKeyDisplay
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Login credentials:")
                                 .font(.caption)
