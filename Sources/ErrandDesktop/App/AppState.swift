@@ -94,6 +94,9 @@ class AppState: ObservableObject {
         // Request notification authorization early
         await NotificationManager.requestAuthorization()
 
+        // On first run, skip keychain/auto-start — the setup wizard handles initial configuration.
+        guard !isFirstRun else { return }
+
         // Load secrets from the macOS Keychain with retry (keychain may be locked briefly after login)
         await loadKeychainSecrets()
 
@@ -103,8 +106,8 @@ class AppState: ObservableObject {
         // Start checking for updates
         updateChecker.startPeriodicChecks()
 
-        // Auto-start containers if enabled and not first run (first run uses the setup wizard)
-        if !isFirstRun && config.autoStartContainers && keychainError == nil && runtimeError == nil {
+        // Auto-start containers if enabled
+        if config.autoStartContainers && keychainError == nil && runtimeError == nil {
             startAllInBackground()
         }
     }

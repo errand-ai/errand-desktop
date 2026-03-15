@@ -3,10 +3,11 @@ import SwiftUI
 @main
 struct ErrandDesktopApp: App {
     @StateObject private var appState = AppState()
-    @Environment(\.openWindow) private var openWindow
 
     init() {
-        // Trigger initialization immediately on app launch, not when the popover opens.
+        // Start initialization at app launch so auto-start works without
+        // waiting for the user to click the menu bar icon. The popover's
+        // .task also calls initialize(), but the guard ensures it only runs once.
         let state = _appState.wrappedValue
         Task { @MainActor in
             await state.initialize()
@@ -17,6 +18,9 @@ struct ErrandDesktopApp: App {
         MenuBarExtra {
             MenuBarPopover()
                 .environmentObject(appState)
+                .task {
+                    await appState.initialize()
+                }
         } label: {
             if let url = Bundle.module.url(forResource: "menubar-icon", withExtension: "png"),
                let nsImage = NSImage(contentsOf: url) {
@@ -30,11 +34,6 @@ struct ErrandDesktopApp: App {
             }
         }
         .menuBarExtraStyle(.window)
-        .onChange(of: appState.isFirstRun) { _, isFirst in
-            if isFirst {
-                openWindow(id: "first-run-setup")
-            }
-        }
 
         Settings {
             SettingsView()

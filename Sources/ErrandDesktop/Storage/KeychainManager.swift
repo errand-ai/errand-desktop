@@ -65,6 +65,7 @@ enum KeychainManager {
 
         var addQuery = query
         addQuery[kSecValueData as String] = data
+        addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
         let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
 
         if addStatus == errSecDuplicateItem {
