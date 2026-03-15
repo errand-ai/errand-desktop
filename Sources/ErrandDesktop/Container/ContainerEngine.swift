@@ -1205,21 +1205,17 @@ actor ContainerEngine {
         switch serviceId {
         case "postgres":
             if isDockerRuntime {
-                let dir = storageManager.dataPath(for: "postgres")
-                try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-                return [dir: "/var/lib/postgresql/data"]
+                // Use a Docker named volume instead of a bind mount. Named volumes are
+                // managed inside Docker's Linux VM, avoiding macOS permission issues
+                // (chown failures) that occur with bind mounts on some systems.
+                return ["errand-postgres-data": "/var/lib/postgresql/data"]
             } else {
                 let diskPath = (try? storageManager.ensureDataDisk(for: "postgres", sizeInMB: 1024)) ?? ""
                 return [diskPath: "/var/lib/postgresql/data"]
             }
         case "valkey":
             if isDockerRuntime {
-                let dir = storageManager.dataPath(for: "valkey")
-                try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-                // Valkey 8 drops to uid 999 after entrypoint. On Colima/virtiofs, chown is
-                // a no-op so the directory must be world-writable. Harmless on Docker Desktop.
-                chmod(dir, 0o777)
-                return [dir: "/data"]
+                return ["errand-valkey-data": "/data"]
             } else {
                 let diskPath = (try? storageManager.ensureDataDisk(for: "valkey", sizeInMB: 256)) ?? ""
                 return [diskPath: "/data"]
