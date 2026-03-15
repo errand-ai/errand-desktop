@@ -21,17 +21,26 @@ jobs:
         run: swift test
 
   release:
-    name: Release
+    name: Release (${{ matrix.arch }})
     needs: build-and-test
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     runs-on: m4-max
     permissions:
       contents: write
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            swift_arch: arm64
+            dmg_suffix: apple-silicon
+          - arch: x86_64
+            swift_arch: x86_64
+            dmg_suffix: intel
     steps:
       - uses: actions/checkout@v4
 
       - name: Build release binary
-        run: swift build -c release
+        run: swift build -c release --arch ${{ matrix.swift_arch }}
 
       - name: Create app bundle
         env:
@@ -114,39 +123,44 @@ jobs:
             "ErrandDesktop.app"
 
       - name: Create DMG
+        env:
+          DMG_SUFFIX: ${{ matrix.dmg_suffix }}
         run: |
           chmod +x scripts/create-dmg.sh
-          scripts/create-dmg.sh ErrandDesktop.app ErrandDesktop.dmg
+          scripts/create-dmg.sh ErrandDesktop.app "ErrandDesktop-${DMG_SUFFIX}.dmg"
 
       - name: Sign DMG
+        env:
+          DMG_SUFFIX: ${{ matrix.dmg_suffix }}
         run: |
           codesign --force --verify --verbose \
             --sign "Developer ID Application" \
-            ErrandDesktop.dmg
+            "ErrandDesktop-${DMG_SUFFIX}.dmg"
 
       - name: Notarize
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           TEAM_ID: ${{ secrets.TEAM_ID }}
+          DMG_SUFFIX: ${{ matrix.dmg_suffix }}
         run: |
-          xcrun notarytool submit ErrandDesktop.dmg \
+          xcrun notarytool submit "ErrandDesktop-${DMG_SUFFIX}.dmg" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_PASSWORD" \
             --team-id "$TEAM_ID" \
             --wait
 
-          xcrun stapler staple ErrandDesktop.dmg
+          xcrun stapler staple "ErrandDesktop-${DMG_SUFFIX}.dmg"
 
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ErrandDesktop.dmg
-          path: ErrandDesktop.dmg
+          name: ErrandDesktop-${{ matrix.dmg_suffix }}.dmg
+          path: "ErrandDesktop-${{ matrix.dmg_suffix }}.dmg"
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: ErrandDesktop.dmg
+          files: "ErrandDesktop-${{ matrix.dmg_suffix }}.dmg"
           generate_release_notes: true
