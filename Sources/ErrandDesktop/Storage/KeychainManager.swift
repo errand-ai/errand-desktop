@@ -5,15 +5,12 @@ import Security
 enum KeychainManager {
 
     private static let service = "sh.errand.ErrandDesktop"
-    private static let accessGroup = "sh.errand.ErrandDesktop"
-
     /// Base query attributes shared by all operations.
     private static func baseQuery(account: String) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
-            kSecAttrAccessGroup as String: accessGroup,
         ]
     }
 
