@@ -785,9 +785,13 @@ actor ContainerEngine {
             try content.write(to: filePath, atomically: true, encoding: .utf8)
         }
 
-        // Create an empty output directory for result.json
+        // Create an empty output directory for result.json.
+        // Set world-writable permissions so the container user can write result.json
+        // via bind mounts on systems where macOS→Linux UID mapping is limited.
         let outputDir = taskBaseDir.appendingPathComponent("output")
         try FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
+        chmod(workspaceDir.path, 0o777)
+        chmod(outputDir.path, 0o777)
 
         let config = ContainerConfig(
             image: qualifiedImage,
