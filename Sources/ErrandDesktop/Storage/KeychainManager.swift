@@ -66,7 +66,15 @@ enum KeychainManager {
         var addQuery = query
         addQuery[kSecValueData as String] = data
         let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
-        guard addStatus == errSecSuccess else {
+
+        if addStatus == errSecDuplicateItem {
+            // Item exists but belongs to a different code signature (delete couldn't remove it).
+            // Update in place instead.
+            let updateStatus = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+            guard updateStatus == errSecSuccess else {
+                throw KeychainError.unhandledError(status: updateStatus)
+            }
+        } else if addStatus != errSecSuccess {
             throw KeychainError.unhandledError(status: addStatus)
         }
     }
