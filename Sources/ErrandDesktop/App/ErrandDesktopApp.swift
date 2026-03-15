@@ -3,6 +3,7 @@ import SwiftUI
 @main
 struct ErrandDesktopApp: App {
     @StateObject private var appState = AppState()
+    @Environment(\.openWindow) private var openWindow
 
     init() {
         // Trigger initialization immediately on app launch, not when the popover opens.
@@ -29,6 +30,11 @@ struct ErrandDesktopApp: App {
             }
         }
         .menuBarExtraStyle(.window)
+        .onChange(of: appState.isFirstRun) { _, isFirst in
+            if isFirst {
+                openWindow(id: "first-run-setup")
+            }
+        }
 
         Settings {
             SettingsView()
