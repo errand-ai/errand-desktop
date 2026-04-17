@@ -11,7 +11,7 @@ let package = Package(
         .executable(name: "ErrandDesktop", targets: ["ErrandDesktop"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/containerization.git", from: "0.26.0"),
+        .package(url: "https://github.com/apple/containerization.git", from: "0.30.1"),
     ],
     targets: [
         .executableTarget(
