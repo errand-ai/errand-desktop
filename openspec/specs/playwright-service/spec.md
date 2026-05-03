@@ -23,14 +23,14 @@ The Playwright container SHALL run with the `--isolated` flag to ensure each Str
 
 ### Requirement: Playwright health check
 
-The app SHALL health-check the Playwright container via HTTP on port 3000.
+The app SHALL health-check the Playwright container via a TCP probe on port 3000. The Playwright MCP server uses Streamable HTTP rather than a plain `/health` endpoint, so a TCP-accept check is sufficient to confirm the listener is up.
 
 #### Scenario: Healthy Playwright
-- **WHEN** the `playwright` container is running and responds on port 3000
+- **WHEN** the `playwright` container is running and accepts TCP connections on port 3000
 - **THEN** the service status is `running`
 
 #### Scenario: Unhealthy Playwright
-- **WHEN** the `playwright` container does not respond to health checks within the timeout
+- **WHEN** the `playwright` container does not accept TCP connections on port 3000 within the timeout
 - **THEN** the service status is `error`
 
 ### Requirement: Playwright URL injection

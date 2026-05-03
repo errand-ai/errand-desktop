@@ -1013,7 +1013,8 @@ actor ContainerEngine {
             return ["alembic", "upgrade", "head"]
         case "playwright":
             // Start Xvfb (virtual display) before the MCP server for non-headless mode.
-            let script = "Xvfb :99 -screen 0 1920x1080x24 -ac -nolisten tcp & sleep 1 && DISPLAY=:99 exec node /app/cli.js --browser chromium --no-sandbox --isolated --port 3000 --host 0.0.0.0 --allowed-hosts '*'"
+            // Poll for the X11 socket rather than a fixed sleep — Xvfb startup time varies by host.
+            let script = "Xvfb :99 -screen 0 1920x1080x24 -ac -nolisten tcp & for i in $(seq 1 50); do [ -S /tmp/.X11-unix/X99 ] && break; sleep 0.1; done; [ -S /tmp/.X11-unix/X99 ] || { echo 'Xvfb failed to create display socket' >&2; exit 1; }; DISPLAY=:99 exec node /app/cli.js --browser chromium --no-sandbox --isolated --port 3000 --host 0.0.0.0 --allowed-hosts '*'"
             if isDockerRuntime {
                 // Docker: entrypoint=["sh","-c"] via entrypointOverride(), Cmd is the script.
                 return [script]
