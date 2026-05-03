@@ -44,7 +44,7 @@ let serviceDependencies: [String: [String]] = [
     "migrate": ["postgres"],
     "litellm": ["postgres"],
     "hindsight": ["postgres", "litellm"],
-    "backend": ["migrate", "litellm"],
+    "backend": ["migrate", "litellm", "playwright"],
 ]
 
 /// Computes a reverse-topological shutdown order from the dependency graph.
