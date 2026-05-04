@@ -57,6 +57,10 @@ actor ContainerEngine {
     /// LiteLLM master key from Keychain, used as the LiteLLM API key for all containers.
     var litellmMasterKey: String = ""
 
+    /// Stable LiteLLM salt key from Keychain, passed as `LITELLM_SALT_KEY` so that
+    /// values encrypted in the database remain decryptable across container restarts.
+    var litellmSaltKey: String = ""
+
     /// Scoped LiteLLM service key for Backend/Worker containers.
     private(set) var errandServiceKey: String = ""
 
@@ -79,6 +83,10 @@ actor ContainerEngine {
 
     func setLiteLLMMasterKey(_ key: String) {
         self.litellmMasterKey = key
+    }
+
+    func setLiteLLMSaltKey(_ key: String) {
+        self.litellmSaltKey = key
     }
 
     // MARK: - Service Key Provisioning
@@ -1152,6 +1160,9 @@ actor ContainerEngine {
                 env["LITELLM_MASTER_KEY"] = litellmMasterKey
                 env["UI_USERNAME"] = "admin"
                 env["UI_PASSWORD"] = litellmMasterKey
+            }
+            if !litellmSaltKey.isEmpty {
+                env["LITELLM_SALT_KEY"] = litellmSaltKey
             }
             env["LITELLM_MODE"] = "PRODUCTION"
             env["LITELLM_PROXY_CONNECTION_TIMEOUT"] = "600"

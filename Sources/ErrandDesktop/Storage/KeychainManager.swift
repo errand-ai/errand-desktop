@@ -36,7 +36,7 @@ enum KeychainManager {
         if let existing = try get(account: account) {
             return existing
         }
-        let key = generateRandomKey(bytesCount: bytesCount)
+        let key = try generateRandomKey(bytesCount: bytesCount)
         try set(account: account, value: key)
         return key
     }
@@ -46,12 +46,29 @@ enum KeychainManager {
         if let existing = try get(account: "litellm-master-key") {
             return existing
         }
-        let key = generateLiteLLMKey()
+        let key = try generateLiteLLMKey()
         try set(account: "litellm-master-key", value: key)
         return key
     }
 
+    /// Retrieves the LiteLLM salt key, or creates a stable 32-byte hex value
+    /// (equivalent to `openssl rand -hex 32`). Without a stable `LITELLM_SALT_KEY`,
+    /// LiteLLM generates a random salt on every startup and previously-encrypted
+    /// values stored in the database (model api_keys, api_bases, SMTP creds, etc.)
+    /// fail to decrypt with `nacl.exceptions.CryptoError`.
+    static func getOrCreateLiteLLMSaltKey() throws -> String {
+        if let existing = try get(account: "litellm-salt-key") {
+            return existing
+        }
+        let key = try generateHexKey(bytesCount: 32)
+        try set(account: "litellm-salt-key", value: key)
+        return key
+    }
+
     /// Retrieves a secret by account name. Returns nil if not found.
+    /// Throws on a locked keychain rather than reporting "not found", so that
+    /// `getOrCreate*` helpers do not silently mint a replacement key when the
+    /// existing one is merely temporarily inaccessible.
     static func get(account: String) throws -> String? {
         // Try the file cache first (immune to code signature changes).
         if let value = readFromFile(account: account) {
@@ -66,8 +83,14 @@ enum KeychainManager {
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
 
-        if status == errSecItemNotFound || status == errSecInteractionNotAllowed {
+        if status == errSecItemNotFound {
             return nil
+        }
+        if status == errSecInteractionNotAllowed {
+            // Keychain is locked. Surface this as an error so callers retry
+            // (loadKeychainSecrets has built-in retry) instead of treating
+            // it as "no entry exists" and rotating the key.
+            throw KeychainError.unhandledError(status: status)
         }
         guard status == errSecSuccess, let data = result as? Data,
               let value = String(data: data, encoding: .utf8) else {
@@ -115,17 +138,31 @@ enum KeychainManager {
 
     // MARK: - Key Generation
 
-    private static func generateRandomKey(bytesCount: Int) -> String {
-        var bytes = [UInt8](repeating: 0, count: bytesCount)
-        _ = SecRandomCopyBytes(kSecRandomDefault, bytesCount, &bytes)
-        return Data(bytes).base64EncodedString()
+    private static func generateRandomKey(bytesCount: Int) throws -> String {
+        return Data(try secureRandomBytes(count: bytesCount)).base64EncodedString()
+    }
+
+    /// Generates a hex-encoded random key (equivalent to `openssl rand -hex <bytesCount>`).
+    private static func generateHexKey(bytesCount: Int) throws -> String {
+        return try secureRandomBytes(count: bytesCount).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Wraps `SecRandomCopyBytes` and propagates RNG failure rather than
+    /// silently returning a zeroed buffer.
+    private static func secureRandomBytes(count: Int) throws -> [UInt8] {
+        var bytes = [UInt8](repeating: 0, count: count)
+        let status = SecRandomCopyBytes(kSecRandomDefault, count, &bytes)
+        guard status == errSecSuccess else {
+            throw KeychainError.unhandledError(status: status)
+        }
+        return bytes
     }
 
     /// Generates a LiteLLM-compatible API key in the format `sk-<18 alphanumeric chars>`.
-    static func generateLiteLLMKey() -> String {
+    /// Throws on RNG failure rather than minting a deterministic key from a zeroed buffer.
+    static func generateLiteLLMKey() throws -> String {
         let chars = Array("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-        var bytes = [UInt8](repeating: 0, count: 18)
-        _ = SecRandomCopyBytes(kSecRandomDefault, 18, &bytes)
+        let bytes = try secureRandomBytes(count: 18)
         let suffix = String(bytes.map { chars[Int($0) % chars.count] })
         return "sk-\(suffix)"
     }
