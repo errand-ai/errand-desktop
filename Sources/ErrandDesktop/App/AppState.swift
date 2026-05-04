@@ -159,8 +159,9 @@ class AppState: ObservableObject {
         }
     }
 
-    /// Loads credential encryption key and LiteLLM master key from the macOS Keychain.
-    /// Retries up to 3 times with a 1-second delay (the keychain may be briefly locked after login).
+    /// Loads the credential encryption key, LiteLLM master key, and LiteLLM salt key
+    /// from the macOS Keychain. Retries up to 3 times with a 1-second delay (the keychain
+    /// may be briefly locked after login).
     /// Sets `keychainError` if all attempts fail — callers must check this before starting containers.
     private func loadKeychainSecrets() async {
         keychainError = nil
@@ -170,8 +171,10 @@ class AppState: ObservableObject {
             do {
                 let encKey = try KeychainManager.getOrCreate(account: "credential-encryption-key")
                 let masterKey = try KeychainManager.getOrCreateLiteLLMKey()
+                let saltKey = try KeychainManager.getOrCreateLiteLLMSaltKey()
                 await containerEngine?.setCredentialEncryptionKey(encKey)
                 await containerEngine?.setLiteLLMMasterKey(masterKey)
+                await containerEngine?.setLiteLLMSaltKey(saltKey)
                 litellmMasterKeyDisplay = masterKey
                 appendLog(service: "system", message: "Keychain secrets loaded successfully")
                 return
