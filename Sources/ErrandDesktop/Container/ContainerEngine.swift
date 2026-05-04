@@ -1021,8 +1021,15 @@ actor ContainerEngine {
             return ["alembic", "upgrade", "head"]
         case "playwright":
             // Start Xvfb (virtual display) before the MCP server for non-headless mode.
-            // Poll for the X11 socket rather than a fixed sleep — Xvfb startup time varies by host.
-            let script = "Xvfb :99 -screen 0 1920x1080x24 -ac -nolisten tcp & for i in $(seq 1 50); do [ -S /tmp/.X11-unix/X99 ] && break; sleep 0.1; done; [ -S /tmp/.X11-unix/X99 ] || { echo 'Xvfb failed to create display socket' >&2; exit 1; }; DISPLAY=:99 exec node /app/cli.js --browser chromium --no-sandbox --isolated --port 3000 --host 0.0.0.0 --allowed-hosts '*'"
+            //
+            // Apple Containerization reuses the rootfs across container restarts, so
+            // /tmp/.X99-lock and /tmp/.X11-unix/X99 from a previous Xvfb process can
+            // survive and make the next Xvfb refuse to start with "Server is already
+            // active for display 99". Scrub the stale lock and socket first.
+            //
+            // Then poll for the X11 socket rather than a fixed sleep — Xvfb startup
+            // time varies by host.
+            let script = "rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null; Xvfb :99 -screen 0 1920x1080x24 -ac -nolisten tcp & for i in $(seq 1 50); do [ -S /tmp/.X11-unix/X99 ] && break; sleep 0.1; done; [ -S /tmp/.X11-unix/X99 ] || { echo 'Xvfb failed to create display socket' >&2; exit 1; }; DISPLAY=:99 exec node /app/cli.js --browser chromium --no-sandbox --isolated --port 3000 --host 0.0.0.0 --allowed-hosts '*'"
             if isDockerRuntime {
                 // Docker: entrypoint=["sh","-c"] via entrypointOverride(), Cmd is the script.
                 return [script]
