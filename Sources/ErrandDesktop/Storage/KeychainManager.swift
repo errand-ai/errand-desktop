@@ -46,7 +46,7 @@ enum KeychainManager {
         if let existing = try get(account: "litellm-master-key") {
             return existing
         }
-        let key = generateLiteLLMKey()
+        let key = try generateLiteLLMKey()
         try set(account: "litellm-master-key", value: key)
         return key
     }
@@ -159,10 +159,10 @@ enum KeychainManager {
     }
 
     /// Generates a LiteLLM-compatible API key in the format `sk-<18 alphanumeric chars>`.
-    static func generateLiteLLMKey() -> String {
+    /// Throws on RNG failure rather than minting a deterministic key from a zeroed buffer.
+    static func generateLiteLLMKey() throws -> String {
         let chars = Array("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-        var bytes = [UInt8](repeating: 0, count: 18)
-        _ = SecRandomCopyBytes(kSecRandomDefault, 18, &bytes)
+        let bytes = try secureRandomBytes(count: 18)
         let suffix = String(bytes.map { chars[Int($0) % chars.count] })
         return "sk-\(suffix)"
     }
