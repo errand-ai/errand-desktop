@@ -809,8 +809,11 @@ actor ContainerEngine {
                 outputDir.path: "/output",
             ],
             network: "errand",
-            cpus: 1,
-            memoryInBytes: 256 * 1024 * 1024,
+            cpus: 2,
+            // Task-runner needs headroom for the Python interpreter, OpenAI/Anthropic
+            // SDKs, an MCP client, the tool catalog, and buffering for a 16k-token
+            // LLM context. 256 MiB OOM-kills the container (exit 137) on real tasks.
+            memoryInBytes: 2 * 1024 * 1024 * 1024,
             rootfsSizeInBytes: 2 * 1024 * 1024 * 1024
         )
 
