@@ -170,8 +170,10 @@ class AppState: ObservableObject {
             do {
                 let encKey = try KeychainManager.getOrCreate(account: "credential-encryption-key")
                 let masterKey = try KeychainManager.getOrCreateLiteLLMKey()
+                let saltKey = try KeychainManager.getOrCreateLiteLLMSaltKey()
                 await containerEngine?.setCredentialEncryptionKey(encKey)
                 await containerEngine?.setLiteLLMMasterKey(masterKey)
+                await containerEngine?.setLiteLLMSaltKey(saltKey)
                 litellmMasterKeyDisplay = masterKey
                 appendLog(service: "system", message: "Keychain secrets loaded successfully")
                 return

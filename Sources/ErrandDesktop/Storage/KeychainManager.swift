@@ -51,6 +51,20 @@ enum KeychainManager {
         return key
     }
 
+    /// Retrieves the LiteLLM salt key, or creates a stable 32-byte hex value
+    /// (equivalent to `openssl rand -hex 32`). Without a stable `LITELLM_SALT_KEY`,
+    /// LiteLLM generates a random salt on every startup and previously-encrypted
+    /// values stored in the database (model api_keys, api_bases, SMTP creds, etc.)
+    /// fail to decrypt with `nacl.exceptions.CryptoError`.
+    static func getOrCreateLiteLLMSaltKey() throws -> String {
+        if let existing = try get(account: "litellm-salt-key") {
+            return existing
+        }
+        let key = generateHexKey(bytesCount: 32)
+        try set(account: "litellm-salt-key", value: key)
+        return key
+    }
+
     /// Retrieves a secret by account name. Returns nil if not found.
     static func get(account: String) throws -> String? {
         // Try the file cache first (immune to code signature changes).
@@ -119,6 +133,13 @@ enum KeychainManager {
         var bytes = [UInt8](repeating: 0, count: bytesCount)
         _ = SecRandomCopyBytes(kSecRandomDefault, bytesCount, &bytes)
         return Data(bytes).base64EncodedString()
+    }
+
+    /// Generates a hex-encoded random key (equivalent to `openssl rand -hex <bytesCount>`).
+    private static func generateHexKey(bytesCount: Int) -> String {
+        var bytes = [UInt8](repeating: 0, count: bytesCount)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytesCount, &bytes)
+        return bytes.map { String(format: "%02x", $0) }.joined()
     }
 
     /// Generates a LiteLLM-compatible API key in the format `sk-<18 alphanumeric chars>`.
