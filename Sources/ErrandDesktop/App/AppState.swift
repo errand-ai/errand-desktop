@@ -537,10 +537,15 @@ class AppState: ObservableObject {
                 let modelInfo = model["model_info"] as? [String: Any]
                 let mode = modelInfo?["mode"] as? String ?? ""
                 let info = ModelInfo(id: name, mode: mode)
+                // LiteLLM only sets `mode` on `model_info` when the user (or
+                // provider metadata) explicitly tags it. Treat missing/unknown
+                // modes as chat so models added via the LiteLLM UI without a
+                // mode tag still appear in the picker. Embeddings are still
+                // gated on an explicit `embedding` tag to avoid mis-listing
+                // chat models in the embedding dropdown.
                 switch mode {
-                case "chat": chat.append(info)
                 case "embedding": embedding.append(info)
-                default: break
+                default: chat.append(info)
                 }
             }
             return (chat, embedding)
