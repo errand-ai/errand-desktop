@@ -22,17 +22,24 @@ The official image's entrypoint is `["node", "cli.js", "--headless", "--browser"
 
 ### Decision: Shell command entrypoint for both runtimes
 
-Both runtimes will use a shell command that starts Xvfb then execs the MCP server:
+Both runtimes use a shell script that scrubs stale X11 lock/socket files, starts Xvfb in the background, polls `/tmp/.X11-unix/X99` until the display socket appears (with a fail-fast if it doesn't), and then `exec`s the MCP server:
 
-```swift
-// Docker: override entrypoint entirely
-// Apple: full command (already the pattern)
-["sh", "-c", "Xvfb :99 -screen 0 1920x1080x24 -ac -nolisten tcp & sleep 1 && DISPLAY=:99 exec node /app/cli.js --browser chromium --no-sandbox --isolated --port 3000 --host 0.0.0.0 --allowed-hosts '*'"]
+```sh
+rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null
+Xvfb :99 -screen 0 1920x1080x24 -ac -nolisten tcp &
+for i in $(seq 1 50); do [ -S /tmp/.X11-unix/X99 ] && break; sleep 0.1; done
+[ -S /tmp/.X11-unix/X99 ] || { echo 'Xvfb failed to create display socket' >&2; exit 1; }
+DISPLAY=:99 exec node /app/cli.js --browser chromium --no-sandbox --isolated --port 3000 --host 0.0.0.0 --allowed-hosts '*'
 ```
 
-For Docker, we also need to clear the image's entrypoint. The Docker Engine API supports this via `"Entrypoint": [""]` in the create body — but this is awkward since `ContainerConfig` currently only has a `command` field (which maps to `Cmd`).
+The lock-scrub is needed because Apple Containerization reuses the rootfs across container restarts, so `/tmp/.X99-lock` and the unix socket from a previous Xvfb survive even though the process does not — leading to "Server is already active for display 99".
 
-**Approach**: Add an `entrypoint` field to `ContainerConfig` (optional, Docker-only). When set, `DockerRuntime.createContainer` includes `"Entrypoint"` in the JSON body. For Docker, set `entrypoint: ["sh", "-c", "<script>"]` and leave `command` nil. For Apple, set `command: ["sh", "-c", "<script>"]` as before.
+For Docker we also need to clear the image's entrypoint. The Docker Engine API takes an `Entrypoint` field in the create body, but `ContainerConfig` previously only had a `command` field (mapped to `Cmd`).
+
+**Approach**: Add an `entrypoint` field to `ContainerConfig` (optional, Docker-only). When set, `DockerRuntime.createContainer` includes `"Entrypoint"` in the JSON body.
+
+- **Docker**: `entrypoint = ["sh", "-c"]` and `command = [<script>]` (the script is a single argument to `sh -c`). Setting `command = ["sh", "-c", <script>]` would pass `<script>` as `$0` rather than executing it.
+- **Apple**: no entrypoint mechanism is available, so the full `["sh", "-c", <script>]` is passed as the `command` and the runtime invokes it directly.
 
 ### Decision: Add shmSize to ContainerConfig
 
