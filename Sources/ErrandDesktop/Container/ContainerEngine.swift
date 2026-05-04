@@ -579,6 +579,8 @@ actor ContainerEngine {
             volumes: volumes,
             ports: portMappings(for: serviceId, config: config),
             command: command,
+            entrypoint: entrypointOverride(for: serviceId),
+            shmSize: shmSizeOverride(for: serviceId),
             rootfsSizeInBytes: rootfsSize(for: serviceId),
             estimatedContentBytes: estimatedContentSize(for: serviceId),
             serviceId: serviceId,
