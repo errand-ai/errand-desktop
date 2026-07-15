@@ -820,8 +820,12 @@ actor ContainerEngine {
             cpus: 2,
             // Task-runner needs headroom for the Python interpreter, OpenAI/Anthropic
             // SDKs, an MCP client, the tool catalog, and buffering for a 16k-token
-            // LLM context. 256 MiB OOM-kills the container (exit 137) on real tasks.
-            memoryInBytes: 2 * 1024 * 1024 * 1024,
+            // LLM context. Observed OOM (exit 137) cliffs:
+            //   256 MiB → first LLM turn
+            //   2 GiB   → second LLM turn (after tool catalog injection)
+            //   4 GiB   → third LLM turn (after first browser tool result, with conversation history)
+            // 8 GiB clears tasks against 35B-class models with multi-turn browser sessions.
+            memoryInBytes: 8 * 1024 * 1024 * 1024,
             rootfsSizeInBytes: 2 * 1024 * 1024 * 1024
         )
 

@@ -23,7 +23,7 @@
 
 The non-headless Playwright path makes task-runner sessions hold more state (MCP catalog, tool calls, browser context). The original 256 MiB / 1 CPU limit was already tight; with the new flow it consistently OOM-kills (exit 137).
 
-- [x] 4.1 Bump task-runner `memoryInBytes` from 256 MiB to 2 GiB and `cpus` from 1 to 2 in `BridgeServer.createTaskContainer`'s ContainerConfig
+- [x] 4.1 Bump task-runner `memoryInBytes` from 256 MiB to 8 GiB and `cpus` from 1 to 2 in `ContainerEngine.createTaskContainer`'s ContainerConfig. Raised in stages as multi-turn browser sessions kept hitting exit 137: 256 MiB → 2 GiB → 8 GiB (8 GiB clears 35B-class models with multi-turn browser tool use).
 
 ## 5. Testing
 
