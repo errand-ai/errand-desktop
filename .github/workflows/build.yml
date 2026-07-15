@@ -12,7 +12,7 @@ jobs:
     name: Build & Test
     runs-on: m4-max
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Build
         run: swift build
@@ -37,7 +37,7 @@ jobs:
             swift_arch: x86_64
             dmg_suffix: intel
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Build release binary
         run: swift build -c release --arch ${{ matrix.swift_arch }}
