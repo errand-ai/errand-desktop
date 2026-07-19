@@ -49,6 +49,12 @@ struct ContainerConfig: Sendable {
     /// Command override (nil = use image default CMD).
     var command: [String]?
 
+    /// Entrypoint override (nil = use image default ENTRYPOINT). Docker runtime only.
+    var entrypoint: [String]?
+
+    /// Shared memory size in bytes (nil = Docker default 64MB). Docker runtime only.
+    var shmSize: Int64?
+
     /// Docker network name to attach to (Docker runtime only).
     var network: String?
 

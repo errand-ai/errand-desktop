@@ -319,6 +319,8 @@ actor ContainerEngine {
         volumes: [String: String],
         ports: [Int: Int],
         command: [String]? = nil,
+        entrypoint: [String]? = nil,
+        shmSize: Int64? = nil,
         rootfsSizeInBytes: UInt64 = 4 * 1024 * 1024 * 1024,
         estimatedContentBytes: UInt64 = 500_000_000,
         serviceId: String? = nil,
@@ -329,7 +331,7 @@ actor ContainerEngine {
 
         let containerId = if let serviceId { "errand-\(serviceId)" } else { "errand-\(UUID().uuidString.prefix(8).lowercased())" }
 
-        let config = ContainerConfig(
+        var config = ContainerConfig(
             image: image,
             env: env,
             ports: ports,
@@ -341,6 +343,8 @@ actor ContainerEngine {
             rootfsSizeInBytes: rootfsSizeInBytes,
             estimatedContentBytes: estimatedContentBytes
         )
+        config.entrypoint = entrypoint
+        config.shmSize = shmSize
 
         try await runtime.createContainer(id: containerId, config: config)
         try await runtime.startContainer(id: containerId)
@@ -575,6 +579,8 @@ actor ContainerEngine {
             volumes: volumes,
             ports: portMappings(for: serviceId, config: config),
             command: command,
+            entrypoint: entrypointOverride(for: serviceId),
+            shmSize: shmSizeOverride(for: serviceId),
             rootfsSizeInBytes: rootfsSize(for: serviceId),
             estimatedContentBytes: estimatedContentSize(for: serviceId),
             serviceId: serviceId,
@@ -701,6 +707,8 @@ actor ContainerEngine {
             volumes: volumes,
             ports: portMappings(for: service.id, config: config),
             command: commandOverride(for: service.id),
+            entrypoint: entrypointOverride(for: service.id),
+            shmSize: shmSizeOverride(for: service.id),
             rootfsSizeInBytes: rootfsSize(for: service.id),
             estimatedContentBytes: estimatedContentSize(for: service.id),
             serviceId: service.id,
@@ -809,8 +817,15 @@ actor ContainerEngine {
                 outputDir.path: "/output",
             ],
             network: "errand",
-            cpus: 1,
-            memoryInBytes: 256 * 1024 * 1024,
+            cpus: 2,
+            // Task-runner needs headroom for the Python interpreter, OpenAI/Anthropic
+            // SDKs, an MCP client, the tool catalog, and buffering for a 16k-token
+            // LLM context. Observed OOM (exit 137) cliffs:
+            //   256 MiB → first LLM turn
+            //   2 GiB   → second LLM turn (after tool catalog injection)
+            //   4 GiB   → third LLM turn (after first browser tool result, with conversation history)
+            // 8 GiB clears tasks against 35B-class models with multi-turn browser sessions.
+            memoryInBytes: 8 * 1024 * 1024 * 1024,
             rootfsSizeInBytes: 2 * 1024 * 1024 * 1024
         )
 
@@ -1014,13 +1029,22 @@ actor ContainerEngine {
         case "migrate":
             return ["alembic", "upgrade", "head"]
         case "playwright":
-            // Docker image has entrypoint that invokes the MCP server,
-            // so Cmd only provides arguments. Apple Containerization has no entrypoint
-            // mechanism, so needs the full command.
+            // Start Xvfb (virtual display) before the MCP server for non-headless mode.
+            //
+            // Apple Containerization reuses the rootfs across container restarts, so
+            // /tmp/.X99-lock and /tmp/.X11-unix/X99 from a previous Xvfb process can
+            // survive and make the next Xvfb refuse to start with "Server is already
+            // active for display 99". Scrub the stale lock and socket first.
+            //
+            // Then poll for the X11 socket rather than a fixed sleep — Xvfb startup
+            // time varies by host.
+            let script = "rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null; Xvfb :99 -screen 0 1920x1080x24 -ac -nolisten tcp & for i in $(seq 1 50); do [ -S /tmp/.X11-unix/X99 ] && break; sleep 0.1; done; [ -S /tmp/.X11-unix/X99 ] || { echo 'Xvfb failed to create display socket' >&2; exit 1; }; DISPLAY=:99 exec node /app/cli.js --browser chromium --no-sandbox --isolated --port 3000 --host 0.0.0.0 --allowed-hosts '*'"
             if isDockerRuntime {
-                return ["--isolated", "--port", "3000", "--host", "0.0.0.0", "--allowed-hosts", "*"]
+                // Docker: entrypoint=["sh","-c"] via entrypointOverride(), Cmd is the script.
+                return [script]
             }
-            return ["node", "/app/cli.js", "--isolated", "--port", "3000", "--host", "0.0.0.0", "--allowed-hosts", "*"]
+            // Apple: no entrypoint mechanism, full command needed.
+            return ["sh", "-c", script]
         case "litellm":
             // Docker image has entrypoint (docker/prod_entrypoint.sh) that invokes litellm,
             // so Cmd only provides arguments. Apple Containerization has no entrypoint
@@ -1029,6 +1053,25 @@ actor ContainerEngine {
                 return ["--config", "/etc/litellm/config.yaml", "--port", "4000", "--host", "0.0.0.0"]
             }
             return ["litellm", "--config", "/etc/litellm/config.yaml", "--port", "4000", "--host", "0.0.0.0"]
+        default:
+            return nil
+        }
+    }
+
+    private func entrypointOverride(for serviceId: String) -> [String]? {
+        guard isDockerRuntime else { return nil }
+        switch serviceId {
+        case "playwright":
+            return ["sh", "-c"]
+        default:
+            return nil
+        }
+    }
+
+    private func shmSizeOverride(for serviceId: String) -> Int64? {
+        switch serviceId {
+        case "playwright":
+            return 2 * 1024 * 1024 * 1024  // 2GB
         default:
             return nil
         }

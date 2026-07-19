@@ -70,4 +70,43 @@ final class ServiceDependencyTests: XCTestCase {
         XCTAssertTrue(lastGroup.contains("gdrive-mcp"))
         XCTAssertTrue(lastGroup.contains("onedrive-mcp"))
     }
+
+    func testPlaywrightHasNoDependencies() {
+        // Playwright is a leaf service that starts in the first wave alongside
+        // postgres/valkey, so it has time to boot Xvfb + Chromium before backend
+        // is created. See backend->playwright dependency below.
+        XCTAssertEqual(serviceDependencies["playwright"], [])
+    }
+
+    func testBackendDependsOnPlaywright() {
+        // Backend's PLAYWRIGHT_MCP_URL env var is only injected at container
+        // creation time. Without this dependency, backend could be built before
+        // Playwright is healthy, leaving the URL pointing at a not-yet-listening
+        // server for the lifetime of the backend container.
+        let backendDeps = serviceDependencies["backend"] ?? []
+        XCTAssertTrue(
+            backendDeps.contains("playwright"),
+            "backend must wait for playwright so PLAYWRIGHT_MCP_URL points at a healthy listener"
+        )
+    }
+
+    func testPlaywrightShutdownAfterBackend() {
+        // Backend depends on playwright, so backend must be in an earlier shutdown
+        // group (higher depth, shut down first) than playwright.
+        let groups = serviceShutdownOrder()
+        var backendGroupIndex: Int?
+        var playwrightGroupIndex: Int?
+        for (idx, group) in groups.enumerated() {
+            if group.contains("backend") { backendGroupIndex = idx }
+            if group.contains("playwright") { playwrightGroupIndex = idx }
+        }
+        guard let backendIdx = backendGroupIndex, let playwrightIdx = playwrightGroupIndex else {
+            XCTFail("backend or playwright missing from shutdown order")
+            return
+        }
+        XCTAssertLessThan(
+            backendIdx, playwrightIdx,
+            "backend must shut down before playwright (it depends on it)"
+        )
+    }
 }

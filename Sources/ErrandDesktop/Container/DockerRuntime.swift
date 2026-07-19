@@ -115,6 +115,11 @@ actor DockerRuntime: ContainerRuntime {
             body["Cmd"] = command
         }
 
+        // Entrypoint override
+        if let entrypoint = config.entrypoint {
+            body["Entrypoint"] = entrypoint
+        }
+
         // Exposed ports (for documentation, actual binding is in HostConfig)
         var exposedPorts: [String: Any] = [:]
         for (_, containerPort) in config.ports {
@@ -145,6 +150,11 @@ actor DockerRuntime: ContainerRuntime {
         }
         if !binds.isEmpty {
             hostConfig["Binds"] = binds
+        }
+
+        // Shared memory size
+        if let shmSize = config.shmSize {
+            hostConfig["ShmSize"] = shmSize
         }
 
         body["HostConfig"] = hostConfig
