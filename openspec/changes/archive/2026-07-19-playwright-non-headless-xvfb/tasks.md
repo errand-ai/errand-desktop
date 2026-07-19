@@ -31,4 +31,4 @@ The non-headless Playwright path makes task-runner sessions hold more state (MCP
 - [x] 5.2 `swift test` 10/10 (including 3 new dependency-graph regression tests)
 - [x] 5.3 `make run` on Apple runtime: Playwright container starts cleanly under Xvfb (no "already active for display 99"), `playwright healthy after 1 attempts`
 - [x] 5.4 Playwright MCP reachable on port 3000; task-runners successfully `Connected to MCP server 'playwright' at http://192.168.64.x:3000/mcp`
-- [ ] 5.5 Manual end-to-end: submit a task that drives Playwright, verify it does not exit 137 and writes `/output/result.json`
+- [x] 5.5 Manual end-to-end: submit a task that drives Playwright, verify it does not exit 137 and writes `/output/result.json`
