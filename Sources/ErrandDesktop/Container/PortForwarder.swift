@@ -1,10 +1,14 @@
 import Foundation
-import Network
+@preconcurrency import Network
 
 /// Forwards TCP connections from localhost to container VM IPs.
 /// Each forwarding rule listens on a local port and relays traffic
 /// to the corresponding container IP and port.
-final class PortForwarder: @unchecked Sendable {
+///
+/// An `actor` so all access to the `rules` array is serialized by the actor
+/// executor. Network framework callbacks are delivered on a dedicated dispatch
+/// queue; they touch only local/Sendable state, never `rules`.
+actor PortForwarder {
 
     /// A single active forwarding rule.
     private struct Rule {
@@ -15,7 +19,11 @@ final class PortForwarder: @unchecked Sendable {
     }
 
     private var rules: [Rule] = []
-    private let queue = DispatchQueue(label: "sh.errand.port-forwarder", attributes: .concurrent)
+
+    /// Dedicated queue for Network framework callbacks (listeners/connections).
+    /// Nonisolated so it can be handed to `NWListener`/`NWConnection` without
+    /// crossing the actor boundary.
+    private nonisolated let networkQueue = DispatchQueue(label: "sh.errand.port-forwarder")
 
     /// Starts forwarding `localPort` on localhost to `remoteHost:remotePort`.
     func forward(localPort: Int, to remoteHost: String, remotePort: Int) throws {
@@ -34,8 +42,11 @@ final class PortForwarder: @unchecked Sendable {
             remotePort: UInt16(remotePort)
         )
 
+        // Capture only Sendable values (not the whole Rule) in the @Sendable handler.
+        let targetHost = remoteHost
+        let targetPort = UInt16(remotePort)
         listener.newConnectionHandler = { [weak self] inbound in
-            self?.handleConnection(inbound, rule: rule)
+            self?.handleConnection(inbound, remoteHost: targetHost, remotePort: targetPort)
         }
 
         listener.stateUpdateHandler = { state in
@@ -49,7 +60,7 @@ final class PortForwarder: @unchecked Sendable {
             }
         }
 
-        listener.start(queue: queue)
+        listener.start(queue: networkQueue)
         rules.append(rule)
     }
 
@@ -64,15 +75,17 @@ final class PortForwarder: @unchecked Sendable {
 
     // MARK: - Private
 
-    private func handleConnection(_ inbound: NWConnection, rule: Rule) {
+    /// Relays a single inbound connection to `remoteHost:remotePort`.
+    /// Nonisolated: it touches no actor state, only the Network transport.
+    private nonisolated func handleConnection(_ inbound: NWConnection, remoteHost: String, remotePort: UInt16) {
         let outbound = NWConnection(
-            host: NWEndpoint.Host(rule.remoteHost),
-            port: NWEndpoint.Port(integerLiteral: rule.remotePort),
+            host: NWEndpoint.Host(remoteHost),
+            port: NWEndpoint.Port(integerLiteral: remotePort),
             using: .tcp
         )
 
-        inbound.start(queue: queue)
-        outbound.start(queue: queue)
+        inbound.start(queue: networkQueue)
+        outbound.start(queue: networkQueue)
 
         outbound.stateUpdateHandler = { state in
             switch state {

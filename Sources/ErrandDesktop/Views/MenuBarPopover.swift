@@ -176,11 +176,10 @@ struct MenuBarPopover: View {
         if serviceId == "litellm" {
             // The BridgeServer serves an auto-login page at /litellm-login that
             // POSTs to LiteLLM's /v2/login, sets the auth cookie on localhost,
-            // and redirects to the UI — no manual login needed.
-            if let url = URL(string: "http://localhost:9876/litellm-login") {
-                NSWorkspace.shared.open(url)
-                return
-            }
+            // and redirects to the UI — no manual login needed. The URL carries
+            // a one-time token minted in-process by the bridge.
+            appState.openLiteLLMUI()
+            return
         }
         if let url = URL(string: urlString) {
             NSWorkspace.shared.open(url)

@@ -20,6 +20,10 @@ class AppState: ObservableObject {
     @Published var isFirstRun: Bool = false
     @Published var logs: [LogEntry] = []
     @Published var selectedLogService: String? = nil
+
+    /// Upper bound on retained in-memory log entries. Oldest entries are
+    /// discarded past this cap to keep memory bounded during long sessions.
+    private let maxLogEntries = 10_000
     @Published var migrationError: String?
     @Published var keychainError: String?
     @Published var runtimeError: String?
@@ -172,9 +176,11 @@ class AppState: ObservableObject {
                 let encKey = try KeychainManager.getOrCreate(account: "credential-encryption-key")
                 let masterKey = try KeychainManager.getOrCreateLiteLLMKey()
                 let saltKey = try KeychainManager.getOrCreateLiteLLMSaltKey()
+                let pgPassword = try KeychainManager.getOrCreatePostgresPassword()
                 await containerEngine?.setCredentialEncryptionKey(encKey)
                 await containerEngine?.setLiteLLMMasterKey(masterKey)
                 await containerEngine?.setLiteLLMSaltKey(saltKey)
+                await containerEngine?.setPostgresPassword(pgPassword)
                 litellmMasterKeyDisplay = masterKey
                 appendLog(service: "system", message: "Keychain secrets loaded successfully")
                 return
@@ -223,13 +229,16 @@ class AppState: ObservableObject {
             throw AppError.keychainNotReady
         }
 
-        // Start the bridge API server so the worker can create task-runner containers
-        try await bridgeServer?.start()
+        // Start the bridge API server so the worker can create task-runner containers.
+        // Pass the vmnet gateway IP so the bridge accepts worker connections from
+        // the container subnet while rejecting arbitrary LAN hosts.
+        let gatewayIP = await containerEngine?.hostGateway()
+        try await bridgeServer?.start(allowedGatewayIP: gatewayIP)
 
         // Clear existing port forwards before starting fresh (Docker publishes ports natively)
         let needsPortForwarding = activeRuntime != .docker
         if needsPortForwarding {
-            portForwarder.stopAll()
+            await portForwarder.stopAll()
         }
 
         // Start services in dependency order with UI progress updates.
@@ -254,14 +263,14 @@ class AppState: ObservableObject {
                                 if needsPortForwarding, let port = service.port, let ip = service.containerIP {
                                     let remotePort = service.containerPort ?? port
                                     do {
-                                        try self.portForwarder.forward(localPort: port, to: ip, remotePort: remotePort)
+                                        try await self.portForwarder.forward(localPort: port, to: ip, remotePort: remotePort)
                                     } catch {
                                         self.appendLog(service: id, message: "Port forwarding failed for port \(port): \(error.localizedDescription)")
                                     }
                                     // Hindsight exposes both a UI (9999) and API (8888)
                                     if id == "hindsight" {
                                         do {
-                                            try self.portForwarder.forward(localPort: 8888, to: ip, remotePort: 8888)
+                                            try await self.portForwarder.forward(localPort: 8888, to: ip, remotePort: 8888)
                                         } catch {
                                             self.appendLog(service: id, message: "Port forwarding failed for port 8888: \(error.localizedDescription)")
                                         }
@@ -307,7 +316,7 @@ class AppState: ObservableObject {
 
         healthChecker?.stopMonitoring()
         if activeRuntime != .docker {
-            portForwarder.stopAll()
+            await portForwarder.stopAll()
         }
         if let engine = containerEngine {
             services = try await engine.stopAll(
@@ -336,6 +345,16 @@ class AppState: ObservableObject {
         }
     }
 
+    /// Opens the LiteLLM UI via the bridge's one-time auto-login URL.
+    /// The bridge mints a short-lived token in-process (the browser cannot
+    /// attach the bearer token), then we open the resulting URL.
+    func openLiteLLMUI() {
+        Task {
+            guard let url = await bridgeServer?.makeLiteLLMLoginURL() else { return }
+            NSWorkspace.shared.open(url)
+        }
+    }
+
     func saveConfig() {
         storageManager?.saveConfig(config)
     }
@@ -352,6 +371,10 @@ class AppState: ObservableObject {
             options: .regularExpression
         )
         logs.append(LogEntry(timestamp: Date(), service: service, message: cleaned))
+        // Ring-buffer semantics: drop the oldest entries once over the cap.
+        if logs.count > maxLogEntries {
+            logs.removeFirst(logs.count - maxLogEntries)
+        }
     }
 
     func pullRequiredImages() async {
@@ -467,7 +490,7 @@ class AppState: ObservableObject {
 
             // Set up port forwarding for LiteLLM so localhost:{litellmPort} works (Apple only; Docker publishes natively)
             if activeRuntime != .docker, let ip = services[litellmIdx].containerIP {
-                try portForwarder.forward(localPort: config.litellmPort, to: ip, remotePort: 4000)
+                try await portForwarder.forward(localPort: config.litellmPort, to: ip, remotePort: 4000)
             }
 
             // Provision scoped service keys now that LiteLLM is healthy

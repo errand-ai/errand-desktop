@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 @preconcurrency import Network
 
 /// Monitors health of running services via TCP/HTTP checks.
@@ -100,18 +101,29 @@ class HealthChecker {
                 using: .tcp
             )
             let queue = DispatchQueue(label: "health-tcp-\(host):\(port)")
-            nonisolated(unsafe) var resumed = false
+            // The state handler and the timeout closure race on separate queue
+            // dispatches; a Mutex-guarded flag ensures a single resume. Returns
+            // true only for the caller that wins the claim.
+            let resumed = Mutex(false)
+            @Sendable func claimResume() -> Bool {
+                resumed.withLock { done in
+                    guard !done else { return false }
+                    done = true
+                    return true
+                }
+            }
 
             connection.stateUpdateHandler = { state in
-                guard !resumed else { return }
                 switch state {
                 case .ready:
-                    resumed = true
-                    connection.cancel()
-                    continuation.resume(returning: true)
+                    if claimResume() {
+                        connection.cancel()
+                        continuation.resume(returning: true)
+                    }
                 case .failed, .cancelled:
-                    resumed = true
-                    continuation.resume(returning: false)
+                    if claimResume() {
+                        continuation.resume(returning: false)
+                    }
                 default:
                     break
                 }
@@ -121,10 +133,10 @@ class HealthChecker {
 
             // Timeout after 5 seconds
             queue.asyncAfter(deadline: .now() + 5) {
-                guard !resumed else { return }
-                resumed = true
-                connection.cancel()
-                continuation.resume(returning: false)
+                if claimResume() {
+                    connection.cancel()
+                    continuation.resume(returning: false)
+                }
             }
         }
     }

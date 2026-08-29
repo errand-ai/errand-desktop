@@ -54,6 +54,10 @@ actor ContainerEngine {
     /// Credential encryption key from Keychain, injected into backend/worker containers.
     var credentialEncryptionKey: String = ""
 
+    /// Postgres password from Keychain, injected into the Postgres container and
+    /// every service's DATABASE_URL. Replaces the former hardcoded `postgres`.
+    var postgresPassword: String = ""
+
     /// LiteLLM master key from Keychain, used as the LiteLLM API key for all containers.
     var litellmMasterKey: String = ""
 
@@ -77,8 +81,19 @@ actor ContainerEngine {
         self.bridgePort = port
     }
 
+    /// The gateway IP containers use to reach the host (vmnet gateway for Apple,
+    /// `host.docker.internal` for Docker). Used by the BridgeServer to allow
+    /// worker connections from the container subnet.
+    func hostGateway() -> String {
+        hostGatewayIP
+    }
+
     func setCredentialEncryptionKey(_ key: String) {
         self.credentialEncryptionKey = key
+    }
+
+    func setPostgresPassword(_ password: String) {
+        self.postgresPassword = password
     }
 
     func setLiteLLMMasterKey(_ key: String) {
@@ -1126,7 +1141,7 @@ actor ContainerEngine {
         switch serviceId {
         case "postgres":
             env["POSTGRES_USER"] = "postgres"
-            env["POSTGRES_PASSWORD"] = "postgres"
+            env["POSTGRES_PASSWORD"] = postgresPassword
             env["POSTGRES_DB"] = "errand"
             env["PGDATA"] = "/var/lib/postgresql/data/pgdata"
 
@@ -1135,12 +1150,12 @@ actor ContainerEngine {
 
         case "migrate":
             if let pgHost = resolveHost("postgres") {
-                env["DATABASE_URL"] = "postgresql://postgres:postgres@\(pgHost):5432/errand"
+                env["DATABASE_URL"] = "postgresql://postgres:\(postgresPassword)@\(pgHost):5432/errand"
             }
 
         case "backend":
             if let pgHost = resolveHost("postgres") {
-                env["DATABASE_URL"] = "postgresql://postgres:postgres@\(pgHost):5432/errand"
+                env["DATABASE_URL"] = "postgresql://postgres:\(postgresPassword)@\(pgHost):5432/errand"
             }
             if let vkHost = resolveHost("valkey") {
                 env["VALKEY_URL"] = "redis://\(vkHost):6379"
@@ -1192,10 +1207,10 @@ actor ContainerEngine {
             env["HOST"] = "0.0.0.0"
             env["PORT"] = "4000"
             env["DATABASE_USERNAME"] = "postgres"
-            env["DATABASE_PASSWORD"] = "postgres"
+            env["DATABASE_PASSWORD"] = postgresPassword
             if let pgHost = resolveHost("postgres") {
                 env["DATABASE_HOST"] = pgHost
-                env["DATABASE_URL"] = "postgresql://postgres:postgres@\(pgHost):5432/litellm"
+                env["DATABASE_URL"] = "postgresql://postgres:\(postgresPassword)@\(pgHost):5432/litellm"
             }
             env["DATABASE_NAME"] = "litellm"
             if !litellmMasterKey.isEmpty {
@@ -1212,7 +1227,7 @@ actor ContainerEngine {
 
         case "hindsight":
             if let pgHost = resolveHost("postgres") {
-                env["HINDSIGHT_API_DATABASE_URL"] = "postgresql://postgres:postgres@\(pgHost):5432/hindsight"
+                env["HINDSIGHT_API_DATABASE_URL"] = "postgresql://postgres:\(postgresPassword)@\(pgHost):5432/hindsight"
             }
             env["HINDSIGHT_API_PORT"] = "8888"
             env["HINDSIGHT_API_HOST"] = "0.0.0.0"
