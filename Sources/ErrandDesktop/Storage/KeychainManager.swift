@@ -201,9 +201,12 @@ enum KeychainManager {
         // surfaces rather than silently leaving secrets world-readable.
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir)
-        // Restrict the secret file itself: owner read/write only.
-        try? value.write(toFile: filePath(account: account), atomically: true, encoding: .utf8)
-        try? FileManager.default.setAttributes(
+        // The file cache is the authoritative store (keychain writes are
+        // best-effort), so a failed write must surface rather than leaving the
+        // caller believing the secret was persisted. Same for the 0o600 chmod:
+        // silently skipping it would leave the secret at the default mode.
+        try value.write(toFile: filePath(account: account), atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
             [.posixPermissions: 0o600],
             ofItemAtPath: filePath(account: account)
         )

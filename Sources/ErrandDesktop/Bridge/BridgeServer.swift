@@ -7,7 +7,9 @@ import Security
 ///
 /// The socket binds to all interfaces (so worker containers on the vmnet
 /// subnet can reach it), but every connection's source address is validated:
-/// only loopback and hosts on the vmnet gateway's subnet are served. All API
+/// only loopback and hosts on the vmnet gateway's subnet are served, falling
+/// back to the RFC 1918 private ranges when the runtime exposes no numeric
+/// gateway (Docker). All API
 /// routes require a bearer token; the browser-facing `/litellm-login` page
 /// instead requires a short-lived one-time token.
 actor BridgeServer {
@@ -22,7 +24,7 @@ actor BridgeServer {
     /// loopback and from any peer on this address's /24 subnet (containers
     /// connect from their own subnet-peer IPs, not the gateway itself).
     /// Nil when the runtime does not expose a numeric gateway (e.g. Docker),
-    /// in which case source-address validation is skipped.
+    /// in which case peers are validated against the RFC 1918 private ranges.
     private var allowedGatewayIPv4: IPv4Address?
 
     /// Active one-time login tokens mapped to their creation time.
@@ -44,7 +46,8 @@ actor BridgeServer {
     /// The socket binds to all interfaces so containers on the vmnet subnet can
     /// reach it, but `accept(_:)` rejects any peer that is not loopback or on the
     /// `allowedGatewayIP` subnet. Pass the vmnet gateway IP so worker containers
-    /// are permitted; pass a non-numeric value (Docker) to skip validation.
+    /// are permitted; pass a non-numeric value (Docker, whose gateway is the name
+    /// `host.docker.internal`) to fall back to the RFC 1918 private ranges.
     func start(port: UInt16 = 9876, allowedGatewayIP: String? = nil) throws {
         let params = NWParameters.tcp
 
@@ -55,7 +58,7 @@ actor BridgeServer {
         self.boundPort = port
         self.allowedGatewayIPv4 = allowedGatewayIP.flatMap { IPv4Address($0) }
         if allowedGatewayIP != nil && self.allowedGatewayIPv4 == nil {
-            print("[BridgeServer] Gateway '\(allowedGatewayIP!)' is not a numeric IPv4 — source validation disabled")
+            print("[BridgeServer] Gateway '\(allowedGatewayIP!)' is not a numeric IPv4 — falling back to RFC 1918 ranges")
         }
 
         let listener = try NWListener(using: params, on: nwPort)
@@ -153,13 +156,13 @@ actor BridgeServer {
 
     // MARK: - Source-Address Validation
 
-    /// Returns true if the connection's peer is loopback or on the vmnet
-    /// gateway's /24 subnet. When no numeric gateway is known, all peers are
-    /// allowed (the socket is still only reachable per the OS firewall).
+    /// Returns true if the connection's peer is loopback, on the vmnet gateway's
+    /// /24 subnet, or — when no numeric gateway is known — in an RFC 1918 range.
     private func isAllowedPeer(_ connection: NWConnection) -> Bool {
         guard let host = remoteHost(of: connection) else {
-            // Peer address is unavailable — fail open only when we also have no
-            // gateway to validate against; otherwise reject.
+            // Peer address is unavailable, so there is nothing to validate. Fail
+            // open only when we also have no gateway (Docker), where rejecting
+            // would break worker traffic; otherwise reject.
             return allowedGatewayIPv4 == nil
         }
 
@@ -180,13 +183,30 @@ actor BridgeServer {
         }
     }
 
-    /// Validates a 4-byte IPv4 address against loopback (127/8) and the gateway /24.
+    /// Validates a 4-byte IPv4 address against loopback (127/8) and the gateway /24,
+    /// falling back to the RFC 1918 ranges when no numeric gateway is known.
     private func isAllowedIPv4Bytes(_ bytes: [UInt8]) -> Bool {
         guard bytes.count == 4 else { return false }
         if bytes[0] == 127 { return true } // loopback 127.0.0.0/8
-        guard let gateway = allowedGatewayIPv4 else { return true } // no gateway: skip
+        guard let gateway = allowedGatewayIPv4 else { return isPrivateIPv4(bytes) }
         let gw = Array(gateway.rawValue)
         return bytes[0] == gw[0] && bytes[1] == gw[1] && bytes[2] == gw[2]
+    }
+
+    /// True for the RFC 1918 private ranges: 10/8, 172.16/12, 192.168/16.
+    ///
+    /// Used only when the runtime exposes no numeric gateway (Docker), where the
+    /// container subnet is private but not known ahead of time. This blocks peers
+    /// reaching us over a public/routable address; it does not isolate us from
+    /// other hosts on the same private LAN, which remains the reason every API
+    /// route also requires the bearer token.
+    private func isPrivateIPv4(_ bytes: [UInt8]) -> Bool {
+        switch (bytes[0], bytes[1]) {
+        case (10, _): return true
+        case (172, 16...31): return true
+        case (192, 168): return true
+        default: return false
+        }
     }
 
     /// Extracts the remote peer's host from an inbound connection.

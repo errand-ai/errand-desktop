@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: BridgeServer rejects connections from non-local peers
-The BridgeServer SHALL validate the remote address of every incoming TCP connection and immediately close connections that do not originate from 127.0.0.1 or the host's active vmnet gateway address.
+The BridgeServer SHALL validate the remote address of every incoming TCP connection and immediately close connections that do not originate from 127.0.0.1 or the host's active vmnet gateway address. When the runtime exposes no numeric gateway address (Docker, whose gateway is the name `host.docker.internal`), the BridgeServer SHALL instead accept only peers whose address falls in an RFC 1918 private range.
 
 #### Scenario: Connection from LAN device is rejected
 - **WHEN** a TCP connection arrives with a remote IP that is not 127.0.0.1 and not the vmnet gateway
@@ -14,6 +14,14 @@ The BridgeServer SHALL validate the remote address of every incoming TCP connect
 #### Scenario: Connection from vmnet gateway is accepted
 - **WHEN** a TCP connection arrives from the host vmnet gateway IP
 - **THEN** the BridgeServer proceeds to read and handle the HTTP request normally
+
+#### Scenario: Connection from the container subnet is accepted under Docker
+- **WHEN** the runtime is Docker, so no numeric gateway is known, **AND** a TCP connection arrives from an RFC 1918 address such as the Docker bridge subnet
+- **THEN** the BridgeServer proceeds to read and handle the HTTP request normally
+
+#### Scenario: Connection from a public address is rejected under Docker
+- **WHEN** the runtime is Docker, so no numeric gateway is known, **AND** a TCP connection arrives from an address outside 127.0.0.0/8 and the RFC 1918 ranges
+- **THEN** the BridgeServer closes the connection without reading any data and logs a warning
 
 ---
 
@@ -87,7 +95,7 @@ The in-memory log buffer in `AppState` SHALL never exceed 10,000 entries. When t
 
 #### Scenario: Log buffer is capped after 10,000 entries
 - **WHEN** `appendLog` is called and the log buffer already contains 10,000 entries
-- **THEN** the oldest entry is removed before the new entry is appended, keeping the count at 10,000
+- **THEN** the oldest entries are discarded in a batch so the count never exceeds 10,000, and the array is not shifted on every subsequent append
 
 ---
 

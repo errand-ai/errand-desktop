@@ -24,6 +24,11 @@ class AppState: ObservableObject {
     /// Upper bound on retained in-memory log entries. Oldest entries are
     /// discarded past this cap to keep memory bounded during long sessions.
     private let maxLogEntries = 10_000
+
+    /// Extra entries dropped each time the cap is hit. `removeFirst` shifts the
+    /// whole array, so trimming one entry per append would make every append at
+    /// the cap O(n); dropping a batch amortises that across this many appends.
+    private let logTrimBatch = 1_000
     @Published var migrationError: String?
     @Published var keychainError: String?
     @Published var runtimeError: String?
@@ -371,9 +376,11 @@ class AppState: ObservableObject {
             options: .regularExpression
         )
         logs.append(LogEntry(timestamp: Date(), service: service, message: cleaned))
-        // Ring-buffer semantics: drop the oldest entries once over the cap.
+        // Ring-buffer semantics: drop the oldest entries once over the cap,
+        // in batches so the count stays under `maxLogEntries` without paying an
+        // array shift on every append.
         if logs.count > maxLogEntries {
-            logs.removeFirst(logs.count - maxLogEntries)
+            logs.removeFirst(logs.count - maxLogEntries + logTrimBatch)
         }
     }
 
