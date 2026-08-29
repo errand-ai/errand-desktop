@@ -4,7 +4,7 @@ A comprehensive code review (GitHub issue #4) identified two critical security v
 
 ## What Changes
 
-- **BridgeServer** bound to loopback (127.0.0.1) instead of all interfaces; `/litellm-login` endpoint now requires bearer token authentication
+- **BridgeServer** validates the source address of every inbound connection, accepting only loopback and peers on the vmnet gateway subnet (the socket still binds all interfaces so worker containers can reach it — see design decision D1); `/litellm-login` now requires a short-lived one-time token, minted by the new authenticated `/litellm-login-url` endpoint
 - **Postgres credentials** generated randomly at first run and stored in Keychain instead of hardcoded `postgres:postgres`
 - **Race conditions** in `DockerHTTPClient` and `HealthChecker` eliminated by protecting the `resumed` flag with a `Mutex`
 - **Secrets directory** created with `0o700` permissions instead of `0o755`
@@ -16,14 +16,14 @@ A comprehensive code review (GitHub issue #4) identified two critical security v
 ## Capabilities
 
 ### New Capabilities
-- `bridge-server-hardening`: Loopback-only binding, authenticated `/litellm-login`, container ID validation, request body size limit
+- `bridge-server-hardening`: Source-address validation on every connection, one-time-token auth for `/litellm-login`, container ID validation, request body size limit
 
 ### Modified Capabilities
 - `litellm-service-keys`: Postgres credentials now generated randomly at first run and stored in Keychain; delta spec needed for credential management requirement change
 
 ## Impact
 
-- `Sources/ErrandDesktop/Bridge/BridgeServer.swift` — binding address, auth on `/litellm-login`, container ID validation, body size limit
+- `Sources/ErrandDesktop/Bridge/BridgeServer.swift` — source-address validation, one-time-token auth on `/litellm-login`, container ID validation, body size limit
 - `Sources/ErrandDesktop/ContainerEngine.swift` — random Postgres credential generation
 - `Sources/ErrandDesktop/KeychainManager.swift` — store/retrieve Postgres credentials; secrets directory permissions
 - `Sources/ErrandDesktop/DockerHTTPClient.swift` — `Mutex`-protected `resumed` flag
