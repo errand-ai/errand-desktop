@@ -41,3 +41,10 @@
 - [x] 7.5 Extract peer-address, one-time-token, and container-route logic out of the `BridgeServer` actor into testable value types (`Bridge/BridgePolicy.swift`)
 - [x] 7.6 Unit-test `PeerAddressPolicy`: loopback, gateway /24, other private subnets, IPv6 and IPv4-mapped peers, and the RFC 1918 fallback including the public-source case that cannot be reproduced on a developer machine
 - [x] 7.7 Unit-test `LoginTokenStore` (single use, expiry, sweep), `ContainerRoute` (traversal and character/length validation), and `HTTPRequest` parsing (query decoding, body size limit)
+
+## 8. Postgres Credential Migration
+
+- [x] 8.1 Add `PostgresCredentialReconciler` and `PostgresCredentialIO` (`Container/PostgresCredentials.swift`) — probe the running database, rotate off the legacy `postgres` password, persisting the new password before altering the database so an interrupted rotation is recoverable
+- [x] 8.2 Add `ContainerPostgresCredentialIO` running `psql` inside the Postgres container: probe over TCP (password auth) and rotate over the unix socket (trust auth, so no current password is needed); refuse any non-alphanumeric password rather than interpolating it into a shell command
+- [x] 8.3 Call the reconciler from `ContainerEngine.startAll` once Postgres is healthy and before dependent services are spawned
+- [x] 8.4 Unit-test the reconciler: fresh install, upgrade, stale stored password, rotation failure, persist failure, unknown credentials, and recovery after an interrupted rotation

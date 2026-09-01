@@ -18,3 +18,24 @@ The app SHALL generate a random Postgres password at first run and store it in t
 #### Scenario: Postgres container fails to start due to credential mismatch
 - **WHEN** the Postgres container fails its health check and the Keychain password differs from the initialized disk password
 - **THEN** the app logs an error indicating a possible credential mismatch and prompts the user to reset Postgres data
+
+---
+
+### Requirement: Existing databases are migrated off the legacy password
+On an install whose data directory predates generated credentials, `POSTGRES_PASSWORD` is ignored because `PGDATA` already exists, so the database still uses the shared default `postgres`. Once Postgres is healthy and before any dependent service is started, the app SHALL determine which password the database actually accepts and, when it is the legacy one, rotate it to the generated password. The generated password SHALL be recorded before the database is altered, so that an interrupted rotation is recoverable.
+
+#### Scenario: Stored password already works
+- **WHEN** Postgres becomes healthy and the stored password authenticates
+- **THEN** the app uses it unchanged and performs no rotation
+
+#### Scenario: Upgraded install is rotated off the legacy password
+- **WHEN** Postgres becomes healthy, the stored password does not authenticate, and the legacy password `postgres` does
+- **THEN** the app records a freshly generated password, alters the database to use it, and hands that password to dependent services
+
+#### Scenario: Rotation is interrupted
+- **WHEN** the generated password has been recorded but altering the database did not complete
+- **THEN** the database keeps the legacy password for the current run, and the next launch detects this and retries the rotation
+
+#### Scenario: Neither password authenticates
+- **WHEN** neither the stored nor the legacy password authenticates
+- **THEN** the app reports that it cannot authenticate to Postgres rather than starting dependent services with a password known to be wrong

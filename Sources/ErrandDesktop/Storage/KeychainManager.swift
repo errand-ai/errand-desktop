@@ -46,13 +46,18 @@ enum KeychainManager {
     /// `postgres-password`). Alphanumeric (hex) so it is safe to embed
     /// verbatim in a `DATABASE_URL` without percent-encoding.
     static func getOrCreatePostgresPassword() throws -> String {
-        if let existing = try get(account: "postgres-password") {
+        if let existing = try get(account: postgresPasswordAccount) {
             return existing
         }
         let password = UUID().uuidString.replacingOccurrences(of: "-", with: "")
-        try set(account: "postgres-password", value: password)
+        try set(account: postgresPasswordAccount, value: password)
         return password
     }
+
+    /// Keychain account holding the Postgres password. Shared with the
+    /// reconciler that migrates existing databases off the legacy credential.
+    static let postgresPasswordAccount = "postgres-password"
+
 
     /// Retrieves the LiteLLM master key, or creates one in `sk-<18 alphanumeric>` format.
     static func getOrCreateLiteLLMKey() throws -> String {

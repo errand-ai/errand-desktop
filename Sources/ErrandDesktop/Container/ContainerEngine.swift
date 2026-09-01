@@ -430,6 +430,42 @@ actor ContainerEngine {
         return (result.exitCode, result.stdout, result.stderr)
     }
 
+    // MARK: - Postgres Credential Reconciliation
+
+    /// Aligns `postgresPassword` with the credential the running database
+    /// actually has, rotating an upgraded install off the legacy shared
+    /// password. Called once Postgres is healthy and before any dependent
+    /// service is started with the password.
+    private func reconcilePostgresCredentials(
+        containerId: String?,
+        onLog: (@Sendable (String, String) -> Void)?
+    ) async {
+        guard let containerId else { return }
+
+        let io = ContainerPostgresCredentialIO(containerId: containerId) { id, command in
+            try await self.execInContainer(containerId: id, command: command)
+        }
+        let stored = postgresPassword.isEmpty ? nil : postgresPassword
+        let (password, outcome) = await PostgresCredentialReconciler(io: io).reconcile(stored: stored)
+        postgresPassword = password
+
+        let message: String?
+        switch outcome {
+        case .matchedStored:
+            message = nil
+        case .rotated:
+            message = "Rotated the Postgres password off the shared default and stored it in the keychain"
+        case .rotationFailed:
+            message = "Postgres is still using the default password — rotation did not complete and will be retried on the next start"
+        case .unknownCredentials:
+            message = "Could not authenticate to Postgres with the stored or default password; dependent services may fail to connect"
+        }
+        debugLog("[ContainerEngine] Postgres credential reconciliation: \(outcome.rawValue)")
+        if let message {
+            onLog?("postgres", message)
+        }
+    }
+
     // MARK: - Dependency-Ordered Startup
 
     /// Starts all services in dependency order, waiting for each to become healthy.
@@ -533,6 +569,14 @@ actor ContainerEngine {
                     failed.insert(serviceId)
                     debugLog("[ContainerEngine] Service \(serviceId) failed, continuing with remaining services")
                 }
+            }
+
+            // Postgres just became available: make sure the password handed to
+            // dependent services is the one the database actually has, before
+            // any of them are spawned with it.
+            if case .success(let (serviceId, service)) = result,
+               serviceId == "postgres", service.status == .running {
+                await reconcilePostgresCredentials(containerId: service.containerId, onLog: onLog)
             }
 
             // Spawn any services that are now unblocked by this completion.
