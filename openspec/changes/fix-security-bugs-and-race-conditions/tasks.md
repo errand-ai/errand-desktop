@@ -35,6 +35,9 @@
 ## 7. Verification
 
 - [x] 7.1 Run `swift build` and confirm zero errors and zero warnings related to these changes
-- [ ] 7.2 Manually test: confirm bridge server rejects a curl request from a non-loopback address
-- [ ] 7.3 Manually test: confirm `/litellm-login` without token returns 401
+- [ ] 7.2 Manually test: confirm bridge server rejects a curl request from a non-loopback address (decision logic covered by 7.6; this remains to prove `accept()` closes the socket before reading)
+- [ ] 7.3 Manually test: confirm `/litellm-login` without token returns 401 (token logic covered by 7.7; this remains to prove the route returns 401)
 - [ ] 7.4 Manually test: confirm app starts cleanly and Postgres initializes with the generated password on a fresh data directory
+- [x] 7.5 Extract peer-address, one-time-token, and container-route logic out of the `BridgeServer` actor into testable value types (`Bridge/BridgePolicy.swift`)
+- [x] 7.6 Unit-test `PeerAddressPolicy`: loopback, gateway /24, other private subnets, IPv6 and IPv4-mapped peers, and the RFC 1918 fallback including the public-source case that cannot be reproduced on a developer machine
+- [x] 7.7 Unit-test `LoginTokenStore` (single use, expiry, sweep), `ContainerRoute` (traversal and character/length validation), and `HTTPRequest` parsing (query decoding, body size limit)

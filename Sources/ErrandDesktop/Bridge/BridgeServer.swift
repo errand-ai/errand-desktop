@@ -20,17 +20,11 @@ actor BridgeServer {
     /// The port the listener was started on (used to build login URLs).
     private var boundPort: UInt16 = 9876
 
-    /// The vmnet gateway address, if known. Connections are accepted from
-    /// loopback and from any peer on this address's /24 subnet (containers
-    /// connect from their own subnet-peer IPs, not the gateway itself).
-    /// Nil when the runtime does not expose a numeric gateway (e.g. Docker),
-    /// in which case peers are validated against the RFC 1918 private ranges.
-    private var allowedGatewayIPv4: IPv4Address?
+    /// Decides which peers may be served. See `PeerAddressPolicy`.
+    private var peerPolicy = PeerAddressPolicy(gatewayBytes: nil)
 
-    /// Active one-time login tokens mapped to their creation time.
-    /// Consumed on first use and expired after 60 seconds.
-    private var loginTokens: [String: Date] = [:]
-    private let loginTokenLifetime: TimeInterval = 60
+    /// Active one-time `/litellm-login` tokens. Single use, 60-second lifetime.
+    private var loginTokens = LoginTokenStore(lifetime: 60)
 
     /// Bearer token for authenticating API requests.
     /// Generated at init; pass to worker container as CONTAINER_BRIDGE_TOKEN.
@@ -56,8 +50,8 @@ actor BridgeServer {
         }
 
         self.boundPort = port
-        self.allowedGatewayIPv4 = allowedGatewayIP.flatMap { IPv4Address($0) }
-        if allowedGatewayIP != nil && self.allowedGatewayIPv4 == nil {
+        self.peerPolicy = PeerAddressPolicy(gatewayIP: allowedGatewayIP)
+        if allowedGatewayIP != nil && !peerPolicy.validatesAgainstGateway {
             print("[BridgeServer] Gateway '\(allowedGatewayIP!)' is not a numeric IPv4 — falling back to RFC 1918 ranges")
         }
 
@@ -127,7 +121,7 @@ actor BridgeServer {
 
             // SSE log streaming is handled separately (keeps connection open)
             if request.method == "GET",
-               let (id, action) = parseContainerRoute(request.path),
+               let (id, action) = ContainerRoute.parse(request.path),
                action == "logs" {
                 await streamLogs(id: id, on: connection)
                 return
@@ -156,57 +150,15 @@ actor BridgeServer {
 
     // MARK: - Source-Address Validation
 
-    /// Returns true if the connection's peer is loopback, on the vmnet gateway's
-    /// /24 subnet, or — when no numeric gateway is known — in an RFC 1918 range.
+    /// Returns true if `peerPolicy` admits the connection's peer.
     private func isAllowedPeer(_ connection: NWConnection) -> Bool {
         guard let host = remoteHost(of: connection) else {
             // Peer address is unavailable, so there is nothing to validate. Fail
             // open only when we also have no gateway (Docker), where rejecting
             // would break worker traffic; otherwise reject.
-            return allowedGatewayIPv4 == nil
+            return !peerPolicy.validatesAgainstGateway
         }
-
-        switch host {
-        case .ipv4(let addr):
-            return isAllowedIPv4Bytes(Array(addr.rawValue))
-        case .ipv6(let addr):
-            let bytes = Array(addr.rawValue)
-            if addr == IPv6Address("::1") { return true }
-            // IPv4-mapped IPv6 (::ffff:a.b.c.d): validate the embedded IPv4.
-            if bytes.count == 16, bytes[10] == 0xff, bytes[11] == 0xff {
-                return isAllowedIPv4Bytes(Array(bytes[12...15]))
-            }
-            return false
-        default:
-            // Hostname endpoints (`.name`) never appear for accepted TCP peers.
-            return false
-        }
-    }
-
-    /// Validates a 4-byte IPv4 address against loopback (127/8) and the gateway /24,
-    /// falling back to the RFC 1918 ranges when no numeric gateway is known.
-    private func isAllowedIPv4Bytes(_ bytes: [UInt8]) -> Bool {
-        guard bytes.count == 4 else { return false }
-        if bytes[0] == 127 { return true } // loopback 127.0.0.0/8
-        guard let gateway = allowedGatewayIPv4 else { return isPrivateIPv4(bytes) }
-        let gw = Array(gateway.rawValue)
-        return bytes[0] == gw[0] && bytes[1] == gw[1] && bytes[2] == gw[2]
-    }
-
-    /// True for the RFC 1918 private ranges: 10/8, 172.16/12, 192.168/16.
-    ///
-    /// Used only when the runtime exposes no numeric gateway (Docker), where the
-    /// container subnet is private but not known ahead of time. This blocks peers
-    /// reaching us over a public/routable address; it does not isolate us from
-    /// other hosts on the same private LAN, which remains the reason every API
-    /// route also requires the bearer token.
-    private func isPrivateIPv4(_ bytes: [UInt8]) -> Bool {
-        switch (bytes[0], bytes[1]) {
-        case (10, _): return true
-        case (172, 16...31): return true
-        case (192, 168): return true
-        default: return false
-        }
+        return peerPolicy.allows(host)
     }
 
     /// Extracts the remote peer's host from an inbound connection.
@@ -290,7 +242,7 @@ actor BridgeServer {
         }
 
         // Container-scoped routes: /containers/{id}[/action]
-        if let (id, action) = parseContainerRoute(request.path) {
+        if let (id, action) = ContainerRoute.parse(request.path) {
             switch (request.method, action) {
             case ("GET", "status"):
                 return await handleGetStatus(id: id)
@@ -307,27 +259,6 @@ actor BridgeServer {
         }
 
         return .notFound
-    }
-
-    /// Parses paths like `/containers/{id}` or `/containers/{id}/action`.
-    /// Returns nil if the ID does not match `^[a-zA-Z0-9_-]{1,128}$`, which
-    /// blocks path-traversal and other unexpected characters.
-    private func parseContainerRoute(_ path: String) -> (id: String, action: String?)? {
-        let prefix = "/containers/"
-        guard path.hasPrefix(prefix) else { return nil }
-        let rest = String(path.dropFirst(prefix.count))
-        guard !rest.isEmpty else { return nil }
-        let parts = rest.split(separator: "/", maxSplits: 1)
-        let id = String(parts[0])
-        guard isValidContainerID(id) else { return nil }
-        let action = parts.count > 1 ? String(parts[1]) : nil
-        return (id, action)
-    }
-
-    /// Validates a container ID against `^[a-zA-Z0-9_-]{1,128}$`.
-    private func isValidContainerID(_ id: String) -> Bool {
-        guard (1...128).contains(id.count) else { return false }
-        return id.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_" || $0 == "-") }
     }
 
     // MARK: - POST /containers
@@ -420,21 +351,13 @@ actor BridgeServer {
     /// Generates a one-time token, records it, and returns the `/litellm-login` URL.
     private func mintLoginURL() -> String {
         let otp = generateOTP()
-        loginTokens[otp] = Date()
+        loginTokens.mint(otp)
         return "http://localhost:\(boundPort)/litellm-login?token=\(otp)"
     }
 
-    /// Validates and consumes a one-time login token. Tokens are single-use and
-    /// expire after `loginTokenLifetime` seconds.
+    /// Validates and consumes a one-time login token. See `LoginTokenStore`.
     private func consumeLoginToken(_ token: String?) -> Bool {
-        // Opportunistically drop expired tokens.
-        let now = Date()
-        loginTokens = loginTokens.filter { now.timeIntervalSince($0.value) <= loginTokenLifetime }
-
-        guard let token, let created = loginTokens.removeValue(forKey: token) else {
-            return false
-        }
-        return now.timeIntervalSince(created) <= loginTokenLifetime
+        loginTokens.consume(token)
     }
 
     /// Generates a cryptographically random 64-character hex token.
