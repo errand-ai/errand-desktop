@@ -41,7 +41,13 @@ struct PeerAddressPolicy: Sendable {
             if address == IPv6Address("::1") { return true }
             let bytes = Array(address.rawValue)
             // IPv4-mapped IPv6 (::ffff:a.b.c.d): validate the embedded IPv4.
-            if bytes.count == 16, bytes[10] == 0xff, bytes[11] == 0xff {
+            // RFC 4291 requires the leading ten bytes to be zero as well as the
+            // 0xffff marker. Matching on the marker alone would read a routable
+            // address such as 2001:db8::ffff:c0a8:4003 as 192.168.64.3 and admit
+            // a peer that is nowhere near the gateway subnet.
+            if bytes.count == 16,
+               bytes[0...9].allSatisfy({ $0 == 0 }),
+               bytes[10] == 0xff, bytes[11] == 0xff {
                 return allowsIPv4(Array(bytes[12...15]))
             }
             return false

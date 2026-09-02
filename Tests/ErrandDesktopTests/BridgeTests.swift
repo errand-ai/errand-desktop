@@ -54,6 +54,28 @@ final class PeerAddressPolicyGatewayTests: XCTestCase {
         XCTAssertFalse(policy.allows(.ipv6(IPv6Address("2001:db8::1")!)))
     }
 
+    /// A routable IPv6 address can carry the 0xffff marker in bytes 10-11 and an
+    /// allowed-looking IPv4 in its last four bytes. Only a genuine IPv4-mapped
+    /// address (RFC 4291: first ten bytes zero) may be unwrapped — otherwise any
+    /// IPv6 peer could pose as one on the gateway subnet.
+    func testRoutableIPv6CarryingAnAllowedIPv4SuffixIsRejected() {
+        // 2001:db8::ffff:c0a8:4003 ends in 192.168.64.3, which is on the gateway /24.
+        XCTAssertFalse(policy.allows(.ipv6(IPv6Address("2001:db8::ffff:c0a8:4003")!)))
+        // ::ffff:127.0.0.1 embedded in a routable prefix must not read as loopback.
+        XCTAssertFalse(policy.allows(.ipv6(IPv6Address("2001:db8::ffff:7f00:1")!)))
+    }
+
+    func testGenuineIPv4MappedAddressIsStillAccepted() {
+        XCTAssertTrue(policy.allows(.ipv6(IPv6Address("::ffff:192.168.64.3")!)))
+        XCTAssertTrue(policy.allows(.ipv6(IPv6Address("::ffff:127.0.0.1")!)))
+    }
+
+    /// Deprecated IPv4-compatible form (::a.b.c.d) lacks the 0xffff marker and is
+    /// not unwrapped.
+    func testIPv4CompatibleIPv6IsRejected() {
+        XCTAssertFalse(policy.allows(.ipv6(IPv6Address("::192.168.64.3")!)))
+    }
+
     func testHostnamePeerIsRejected() {
         XCTAssertFalse(policy.allows(.name("evil.example.com", nil)))
     }
@@ -100,6 +122,13 @@ final class PeerAddressPolicyPrivateFallbackTests: XCTestCase {
     /// primary control under Docker.
     func testOrdinaryLANHostIsAdmittedByTheFallback() {
         XCTAssertTrue(allows("192.168.1.50"))
+    }
+
+    /// Same bypass, checked under the RFC 1918 fallback: 10.0.0.1 embedded in a
+    /// routable IPv6 address must not be unwrapped.
+    func testRoutableIPv6CarryingAPrivateIPv4SuffixIsRejected() {
+        XCTAssertFalse(policy.allows(.ipv6(IPv6Address("2001:db8::ffff:0a00:1")!)))
+        XCTAssertTrue(policy.allows(.ipv6(IPv6Address("::ffff:10.0.0.1")!)))
     }
 
     func test172RangeBoundaries() {

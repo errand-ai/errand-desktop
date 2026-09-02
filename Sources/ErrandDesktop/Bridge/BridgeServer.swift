@@ -52,7 +52,7 @@ actor BridgeServer {
         self.boundPort = port
         self.peerPolicy = PeerAddressPolicy(gatewayIP: allowedGatewayIP)
         if allowedGatewayIP != nil && !peerPolicy.validatesAgainstGateway {
-            print("[BridgeServer] Gateway '\(allowedGatewayIP!)' is not a numeric IPv4 — falling back to RFC 1918 ranges")
+            debugLog("[BridgeServer] Gateway '\(allowedGatewayIP!)' is not a numeric IPv4 — falling back to RFC 1918 ranges")
         }
 
         let listener = try NWListener(using: params, on: nwPort)

@@ -447,7 +447,13 @@ actor ContainerEngine {
         }
         let stored = postgresPassword.isEmpty ? nil : postgresPassword
         let (password, outcome) = await PostgresCredentialReconciler(io: io).reconcile(stored: stored)
-        postgresPassword = password
+
+        // Only adopt the result when it is a password the database accepted.
+        // Applying a known-bad one would just push the failure downstream into
+        // every dependent service's connection string.
+        if outcome != .unknownCredentials {
+            postgresPassword = password
+        }
 
         let message: String?
         switch outcome {
