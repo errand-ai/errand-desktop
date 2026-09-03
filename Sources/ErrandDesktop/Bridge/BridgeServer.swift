@@ -1,13 +1,30 @@
 @preconcurrency import Network
 import Foundation
+import Security
 
 
 /// Local HTTP server exposing the container bridge API for the worker.
-/// Binds to the loopback interface only, authenticates via bearer token.
+///
+/// The socket binds to all interfaces (so worker containers on the vmnet
+/// subnet can reach it), but every connection's source address is validated:
+/// only loopback and hosts on the vmnet gateway's subnet are served, falling
+/// back to the RFC 1918 private ranges when the runtime exposes no numeric
+/// gateway (Docker). All API
+/// routes require a bearer token; the browser-facing `/litellm-login` page
+/// instead requires a short-lived one-time token.
 actor BridgeServer {
     private let containerEngine: ContainerEngine
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "sh.errand.bridge-server")
+
+    /// The port the listener was started on (used to build login URLs).
+    private var boundPort: UInt16 = 9876
+
+    /// Decides which peers may be served. See `PeerAddressPolicy`.
+    private var peerPolicy = PeerAddressPolicy(gatewayBytes: nil)
+
+    /// Active one-time `/litellm-login` tokens. Single use, 60-second lifetime.
+    private var loginTokens = LoginTokenStore(lifetime: 60)
 
     /// Bearer token for authenticating API requests.
     /// Generated at init; pass to worker container as CONTAINER_BRIDGE_TOKEN.
@@ -18,12 +35,24 @@ actor BridgeServer {
         self.authToken = UUID().uuidString
     }
 
-    /// Start the HTTP server on the given port (all interfaces, so containers can reach it).
-    func start(port: UInt16 = 9876) throws {
+    /// Start the HTTP server on the given port.
+    ///
+    /// The socket binds to all interfaces so containers on the vmnet subnet can
+    /// reach it, but `accept(_:)` rejects any peer that is not loopback or on the
+    /// `allowedGatewayIP` subnet. Pass the vmnet gateway IP so worker containers
+    /// are permitted; pass a non-numeric value (Docker, whose gateway is the name
+    /// `host.docker.internal`) to fall back to the RFC 1918 private ranges.
+    func start(port: UInt16 = 9876, allowedGatewayIP: String? = nil) throws {
         let params = NWParameters.tcp
 
         guard let nwPort = NWEndpoint.Port(rawValue: port) else {
             throw BridgeServerError.invalidPort
+        }
+
+        self.boundPort = port
+        self.peerPolicy = PeerAddressPolicy(gatewayIP: allowedGatewayIP)
+        if allowedGatewayIP != nil && !peerPolicy.validatesAgainstGateway {
+            debugLog("[BridgeServer] Gateway '\(allowedGatewayIP!)' is not a numeric IPv4 — falling back to RFC 1918 ranges")
         }
 
         let listener = try NWListener(using: params, on: nwPort)
@@ -54,14 +83,23 @@ actor BridgeServer {
     // MARK: - Connection Handling
 
     private func accept(_ connection: NWConnection) async {
+        // Reject connections from hosts that are neither loopback nor on the
+        // vmnet gateway subnet, without reading any request data.
+        guard isAllowedPeer(connection) else {
+            debugLog("[BridgeServer] Rejected connection from non-local peer \(remoteIP(of: connection) ?? "unknown")")
+            connection.cancel()
+            return
+        }
+
         connection.start(queue: queue)
 
         do {
             let request = try await receiveRequest(from: connection)
 
-            // Unauthenticated: serves an auto-login page for the LiteLLM UI.
+            // Browser-facing auto-login page for the LiteLLM UI. Requires a valid
+            // one-time token (browsers cannot set the Authorization header).
             if request.method == "GET" && request.path == "/litellm-login" {
-                let response = handleLiteLLMLogin()
+                let response = handleLiteLLMLogin(request)
                 try await send(response, on: connection)
                 connection.cancel()
                 return
@@ -73,9 +111,17 @@ actor BridgeServer {
                 return
             }
 
+            // Authenticated: mints a one-time login URL for the LiteLLM UI.
+            if request.method == "GET" && request.path == "/litellm-login-url" {
+                let response = handleLiteLLMLoginURL()
+                try await send(response, on: connection)
+                connection.cancel()
+                return
+            }
+
             // SSE log streaming is handled separately (keeps connection open)
             if request.method == "GET",
-               let (id, action) = parseContainerRoute(request.path),
+               let (id, action) = ContainerRoute.parse(request.path),
                action == "logs" {
                 await streamLogs(id: id, on: connection)
                 return
@@ -84,6 +130,13 @@ actor BridgeServer {
             let response = await route(request)
             debugLog("[BridgeServer] \(request.method) \(request.path) → \(response.statusCode)")
             try await send(response, on: connection)
+        } catch is HTTPParseError {
+            // Currently only bodyTooLarge.
+            try? await send(
+                .error(413, "Request Entity Too Large",
+                       message: "Request body exceeds \(maxBodyBytes) bytes"),
+                on: connection
+            )
         } catch {
             debugLog("[BridgeServer] Request error: \(error)")
             try? await send(
@@ -93,6 +146,38 @@ actor BridgeServer {
         }
 
         connection.cancel()
+    }
+
+    // MARK: - Source-Address Validation
+
+    /// Returns true if `peerPolicy` admits the connection's peer.
+    private func isAllowedPeer(_ connection: NWConnection) -> Bool {
+        guard let host = remoteHost(of: connection) else {
+            // Peer address is unavailable, so there is nothing to validate. Fail
+            // open only when we also have no gateway (Docker), where rejecting
+            // would break worker traffic; otherwise reject.
+            return !peerPolicy.validatesAgainstGateway
+        }
+        return peerPolicy.allows(host)
+    }
+
+    /// Extracts the remote peer's host from an inbound connection.
+    private func remoteHost(of connection: NWConnection) -> NWEndpoint.Host? {
+        let endpoint = connection.currentPath?.remoteEndpoint ?? connection.endpoint
+        if case let .hostPort(host, _) = endpoint {
+            return host
+        }
+        return nil
+    }
+
+    /// Human-readable remote IP for logging, or nil if unavailable.
+    private func remoteIP(of connection: NWConnection) -> String? {
+        guard let host = remoteHost(of: connection) else { return nil }
+        switch host {
+        case .ipv4(let addr): return addr.debugDescription
+        case .ipv6(let addr): return addr.debugDescription
+        default: return nil
+        }
     }
 
     // MARK: - HTTP I/O
@@ -105,7 +190,7 @@ actor BridgeServer {
             if chunk.isEmpty { throw BridgeServerError.connectionClosed }
             buffer.append(chunk)
 
-            if let request = HTTPRequest.parse(from: buffer) {
+            if let request = try HTTPRequest.parse(from: buffer) {
                 return request
             }
         }
@@ -157,7 +242,7 @@ actor BridgeServer {
         }
 
         // Container-scoped routes: /containers/{id}[/action]
-        if let (id, action) = parseContainerRoute(request.path) {
+        if let (id, action) = ContainerRoute.parse(request.path) {
             switch (request.method, action) {
             case ("GET", "status"):
                 return await handleGetStatus(id: id)
@@ -168,21 +253,12 @@ actor BridgeServer {
             default:
                 break
             }
+        } else if request.path.hasPrefix("/containers/") {
+            // A container-scoped path whose ID failed validation (e.g. path traversal).
+            return .error(400, "Bad Request", message: "Invalid container ID")
         }
 
         return .notFound
-    }
-
-    /// Parses paths like `/containers/{id}` or `/containers/{id}/action`.
-    private func parseContainerRoute(_ path: String) -> (id: String, action: String?)? {
-        let prefix = "/containers/"
-        guard path.hasPrefix(prefix) else { return nil }
-        let rest = String(path.dropFirst(prefix.count))
-        guard !rest.isEmpty else { return nil }
-        let parts = rest.split(separator: "/", maxSplits: 1)
-        let id = String(parts[0])
-        let action = parts.count > 1 ? String(parts[1]) : nil
-        return (id, action)
     }
 
     // MARK: - POST /containers
@@ -264,12 +340,54 @@ actor BridgeServer {
         }
     }
 
-    // MARK: - GET /litellm-login (unauthenticated)
+    // MARK: - LiteLLM Auto-Login (one-time token)
+
+    /// Mints a fresh one-time login URL for the LiteLLM UI. Called in-process by
+    /// the app UI, which cannot attach a bearer token to the system browser.
+    func makeLiteLLMLoginURL() -> URL? {
+        URL(string: mintLoginURL())
+    }
+
+    /// Generates a one-time token, records it, and returns the `/litellm-login` URL.
+    private func mintLoginURL() -> String {
+        let otp = generateOTP()
+        loginTokens.mint(otp)
+        return "http://localhost:\(boundPort)/litellm-login?token=\(otp)"
+    }
+
+    /// Validates and consumes a one-time login token. See `LoginTokenStore`.
+    private func consumeLoginToken(_ token: String?) -> Bool {
+        loginTokens.consume(token)
+    }
+
+    /// Generates a cryptographically random 64-character hex token.
+    private func generateOTP() -> String {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        if status != errSecSuccess {
+            // Fall back to UUIDs (still unpredictable) rather than a fixed value.
+            return (UUID().uuidString + UUID().uuidString).replacingOccurrences(of: "-", with: "")
+        }
+        return bytes.map { String(format: "%02x", $0) }.joined()
+    }
+
+    // MARK: - GET /litellm-login-url (authenticated)
+
+    /// Returns a JSON body `{"url": "http://localhost:<port>/litellm-login?token=<otp>"}`.
+    private func handleLiteLLMLoginURL() -> HTTPResponse {
+        .json(["url": mintLoginURL()])
+    }
+
+    // MARK: - GET /litellm-login?token=<otp>
 
     /// Returns an HTML page that POSTs to LiteLLM's /v2/login via fetch(), setting
     /// the auth cookie on localhost, then redirects to the LiteLLM UI.
     /// Served from localhost:9876 so the cookie domain matches localhost:4000.
-    private func handleLiteLLMLogin() -> HTTPResponse {
+    /// Requires a valid one-time token, which is consumed on use.
+    private func handleLiteLLMLogin(_ request: HTTPRequest) -> HTTPResponse {
+        guard consumeLoginToken(request.queryValue("token")) else {
+            return .unauthorized
+        }
         guard let masterKey = try? KeychainManager.getOrCreateLiteLLMKey() else {
             return .error(500, "Internal Server Error", message: "Unable to read LiteLLM key")
         }

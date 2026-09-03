@@ -54,6 +54,10 @@ actor ContainerEngine {
     /// Credential encryption key from Keychain, injected into backend/worker containers.
     var credentialEncryptionKey: String = ""
 
+    /// Postgres password from Keychain, injected into the Postgres container and
+    /// every service's DATABASE_URL. Replaces the former hardcoded `postgres`.
+    var postgresPassword: String = ""
+
     /// LiteLLM master key from Keychain, used as the LiteLLM API key for all containers.
     var litellmMasterKey: String = ""
 
@@ -77,8 +81,19 @@ actor ContainerEngine {
         self.bridgePort = port
     }
 
+    /// The gateway IP containers use to reach the host (vmnet gateway for Apple,
+    /// `host.docker.internal` for Docker). Used by the BridgeServer to allow
+    /// worker connections from the container subnet.
+    func hostGateway() -> String {
+        hostGatewayIP
+    }
+
     func setCredentialEncryptionKey(_ key: String) {
         self.credentialEncryptionKey = key
+    }
+
+    func setPostgresPassword(_ password: String) {
+        self.postgresPassword = password
     }
 
     func setLiteLLMMasterKey(_ key: String) {
@@ -415,6 +430,48 @@ actor ContainerEngine {
         return (result.exitCode, result.stdout, result.stderr)
     }
 
+    // MARK: - Postgres Credential Reconciliation
+
+    /// Aligns `postgresPassword` with the credential the running database
+    /// actually has, rotating an upgraded install off the legacy shared
+    /// password. Called once Postgres is healthy and before any dependent
+    /// service is started with the password.
+    private func reconcilePostgresCredentials(
+        containerId: String?,
+        onLog: (@Sendable (String, String) -> Void)?
+    ) async {
+        guard let containerId else { return }
+
+        let io = ContainerPostgresCredentialIO(containerId: containerId) { id, command in
+            try await self.execInContainer(containerId: id, command: command)
+        }
+        let stored = postgresPassword.isEmpty ? nil : postgresPassword
+        let (password, outcome) = await PostgresCredentialReconciler(io: io).reconcile(stored: stored)
+
+        // Only adopt the result when it is a password the database accepted.
+        // Applying a known-bad one would just push the failure downstream into
+        // every dependent service's connection string.
+        if outcome != .unknownCredentials {
+            postgresPassword = password
+        }
+
+        let message: String?
+        switch outcome {
+        case .matchedStored:
+            message = nil
+        case .rotated:
+            message = "Rotated the Postgres password off the shared default and stored it in the keychain"
+        case .rotationFailed:
+            message = "Postgres is still using the default password — rotation did not complete and will be retried on the next start"
+        case .unknownCredentials:
+            message = "Could not authenticate to Postgres with the stored or default password; dependent services may fail to connect"
+        }
+        debugLog("[ContainerEngine] Postgres credential reconciliation: \(outcome.rawValue)")
+        if let message {
+            onLog?("postgres", message)
+        }
+    }
+
     // MARK: - Dependency-Ordered Startup
 
     /// Starts all services in dependency order, waiting for each to become healthy.
@@ -518,6 +575,14 @@ actor ContainerEngine {
                     failed.insert(serviceId)
                     debugLog("[ContainerEngine] Service \(serviceId) failed, continuing with remaining services")
                 }
+            }
+
+            // Postgres just became available: make sure the password handed to
+            // dependent services is the one the database actually has, before
+            // any of them are spawned with it.
+            if case .success(let (serviceId, service)) = result,
+               serviceId == "postgres", service.status == .running {
+                await reconcilePostgresCredentials(containerId: service.containerId, onLog: onLog)
             }
 
             // Spawn any services that are now unblocked by this completion.
@@ -1126,7 +1191,7 @@ actor ContainerEngine {
         switch serviceId {
         case "postgres":
             env["POSTGRES_USER"] = "postgres"
-            env["POSTGRES_PASSWORD"] = "postgres"
+            env["POSTGRES_PASSWORD"] = postgresPassword
             env["POSTGRES_DB"] = "errand"
             env["PGDATA"] = "/var/lib/postgresql/data/pgdata"
 
@@ -1135,12 +1200,12 @@ actor ContainerEngine {
 
         case "migrate":
             if let pgHost = resolveHost("postgres") {
-                env["DATABASE_URL"] = "postgresql://postgres:postgres@\(pgHost):5432/errand"
+                env["DATABASE_URL"] = "postgresql://postgres:\(postgresPassword)@\(pgHost):5432/errand"
             }
 
         case "backend":
             if let pgHost = resolveHost("postgres") {
-                env["DATABASE_URL"] = "postgresql://postgres:postgres@\(pgHost):5432/errand"
+                env["DATABASE_URL"] = "postgresql://postgres:\(postgresPassword)@\(pgHost):5432/errand"
             }
             if let vkHost = resolveHost("valkey") {
                 env["VALKEY_URL"] = "redis://\(vkHost):6379"
@@ -1192,10 +1257,10 @@ actor ContainerEngine {
             env["HOST"] = "0.0.0.0"
             env["PORT"] = "4000"
             env["DATABASE_USERNAME"] = "postgres"
-            env["DATABASE_PASSWORD"] = "postgres"
+            env["DATABASE_PASSWORD"] = postgresPassword
             if let pgHost = resolveHost("postgres") {
                 env["DATABASE_HOST"] = pgHost
-                env["DATABASE_URL"] = "postgresql://postgres:postgres@\(pgHost):5432/litellm"
+                env["DATABASE_URL"] = "postgresql://postgres:\(postgresPassword)@\(pgHost):5432/litellm"
             }
             env["DATABASE_NAME"] = "litellm"
             if !litellmMasterKey.isEmpty {
@@ -1212,7 +1277,7 @@ actor ContainerEngine {
 
         case "hindsight":
             if let pgHost = resolveHost("postgres") {
-                env["HINDSIGHT_API_DATABASE_URL"] = "postgresql://postgres:postgres@\(pgHost):5432/hindsight"
+                env["HINDSIGHT_API_DATABASE_URL"] = "postgresql://postgres:\(postgresPassword)@\(pgHost):5432/hindsight"
             }
             env["HINDSIGHT_API_PORT"] = "8888"
             env["HINDSIGHT_API_HOST"] = "0.0.0.0"

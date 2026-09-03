@@ -41,6 +41,24 @@ enum KeychainManager {
         return key
     }
 
+    /// Retrieves the Postgres password, or generates and stores a random
+    /// 32-character alphanumeric one on first call (stored under account
+    /// `postgres-password`). Alphanumeric (hex) so it is safe to embed
+    /// verbatim in a `DATABASE_URL` without percent-encoding.
+    static func getOrCreatePostgresPassword() throws -> String {
+        if let existing = try get(account: postgresPasswordAccount) {
+            return existing
+        }
+        let password = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        try set(account: postgresPasswordAccount, value: password)
+        return password
+    }
+
+    /// Keychain account holding the Postgres password. Shared with the
+    /// reconciler that migrates existing databases off the legacy credential.
+    static let postgresPasswordAccount = "postgres-password"
+
+
     /// Retrieves the LiteLLM master key, or creates one in `sk-<18 alphanumeric>` format.
     static func getOrCreateLiteLLMKey() throws -> String {
         if let existing = try get(account: "litellm-master-key") {
@@ -98,14 +116,15 @@ enum KeychainManager {
         }
 
         // Backfill the file cache so future reads survive signature changes.
-        writeToFile(account: account, value: value)
+        // Best-effort: a cache-write failure must not fail an otherwise-good read.
+        try? writeToFile(account: account, value: value)
         return value
     }
 
     /// Stores a secret. Writes to both the file cache and the keychain.
     static func set(account: String, value: String) throws {
         // Always write to the file cache.
-        writeToFile(account: account, value: value)
+        try writeToFile(account: account, value: value)
 
         // Best-effort write to the keychain.
         guard let data = value.data(using: .utf8) else { return }
@@ -180,12 +199,19 @@ enum KeychainManager {
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    private static func writeToFile(account: String, value: String) {
+    private static func writeToFile(account: String, value: String) throws {
         let dir = secretsDir
-        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        // Restrict permissions: owner read/write only.
-        try? value.write(toFile: filePath(account: account), atomically: true, encoding: .utf8)
-        try? FileManager.default.setAttributes(
+        // Create the secrets directory owner-only (0o700) so no other local user
+        // can read cached secrets. Use `try` (not `try?`) so a permissions failure
+        // surfaces rather than silently leaving secrets world-readable.
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir)
+        // The file cache is the authoritative store (keychain writes are
+        // best-effort), so a failed write must surface rather than leaving the
+        // caller believing the secret was persisted. Same for the 0o600 chmod:
+        // silently skipping it would leave the secret at the default mode.
+        try value.write(toFile: filePath(account: account), atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
             [.posixPermissions: 0o600],
             ofItemAtPath: filePath(account: account)
         )

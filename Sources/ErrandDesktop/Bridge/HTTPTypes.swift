@@ -1,9 +1,22 @@
 import Foundation
 
+/// Maximum accepted HTTP request body size (10 MB). Requests whose
+/// `Content-Length` exceeds this are rejected before the body is buffered,
+/// preventing allocation-based denial of service.
+let maxBodyBytes = 10 * 1024 * 1024
+
+/// Errors raised while parsing an HTTP request that are not simply "need more data".
+enum HTTPParseError: Error {
+    /// The `Content-Length` header exceeds `maxBodyBytes`.
+    case bodyTooLarge
+}
+
 /// A parsed HTTP/1.1 request.
 struct HTTPRequest: Sendable {
     let method: String
     let path: String
+    /// The raw query string (the part after `?`), or nil if the URL had none.
+    let query: String?
     let headers: [(String, String)]
     let body: Data
 
@@ -13,9 +26,23 @@ struct HTTPRequest: Sendable {
         return headers.first { $0.0.lowercased() == lowered }?.1
     }
 
+    /// Returns the value of the given query parameter, or nil if absent.
+    /// Values are percent-decoded; keys are matched exactly.
+    func queryValue(_ name: String) -> String? {
+        guard let query else { return nil }
+        for pair in query.split(separator: "&") {
+            let kv = pair.split(separator: "=", maxSplits: 1)
+            guard let rawKey = kv.first, String(rawKey) == name else { continue }
+            let rawValue = kv.count > 1 ? String(kv[1]) : ""
+            return rawValue.removingPercentEncoding ?? rawValue
+        }
+        return nil
+    }
+
     /// Attempts to parse an HTTP request from raw data.
     /// Returns nil if the data is incomplete (still waiting for headers or body).
-    static func parse(from data: Data) -> HTTPRequest? {
+    /// Throws `HTTPParseError.bodyTooLarge` if the declared body exceeds `maxBodyBytes`.
+    static func parse(from data: Data) throws -> HTTPRequest? {
         let separator = Data([0x0D, 0x0A, 0x0D, 0x0A]) // \r\n\r\n
         guard let sepRange = data.range(of: separator) else { return nil }
 
@@ -29,8 +56,16 @@ struct HTTPRequest: Sendable {
 
         let method = String(parts[0])
         let fullPath = String(parts[1])
-        // Strip query string for routing
-        let path = fullPath.components(separatedBy: "?").first ?? fullPath
+        // Split path from query string; keep the query for parameter lookups.
+        let path: String
+        let query: String?
+        if let qIndex = fullPath.firstIndex(of: "?") {
+            path = String(fullPath[fullPath.startIndex..<qIndex])
+            query = String(fullPath[fullPath.index(after: qIndex)...])
+        } else {
+            path = fullPath
+            query = nil
+        }
 
         var headers: [(String, String)] = []
         for line in lines.dropFirst() where !line.isEmpty {
@@ -46,6 +81,11 @@ struct HTTPRequest: Sendable {
             .first { $0.0.lowercased() == "content-length" }
             .flatMap { Int($0.1) } ?? 0
 
+        // Reject oversized bodies based on the declared length, before buffering them.
+        if contentLength > maxBodyBytes {
+            throw HTTPParseError.bodyTooLarge
+        }
+
         let bodyStart = sepRange.upperBound
         let availableBody = data.endIndex - bodyStart
         if availableBody < contentLength { return nil }
@@ -57,7 +97,7 @@ struct HTTPRequest: Sendable {
             body = Data()
         }
 
-        return HTTPRequest(method: method, path: path, headers: headers, body: body)
+        return HTTPRequest(method: method, path: path, query: query, headers: headers, body: body)
     }
 }
 

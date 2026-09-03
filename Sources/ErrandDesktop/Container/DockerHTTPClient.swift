@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 @preconcurrency import Network
 
 /// Thin HTTP client that communicates with the Docker Engine API over a Unix domain socket.
@@ -135,19 +136,25 @@ actor DockerHTTPClient {
 
     private nonisolated func connect(_ connection: NWConnection) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            nonisolated(unsafe) var resumed = false
+            // `stateUpdateHandler` may fire concurrently from Network's queue with
+            // multiple states; a Mutex-guarded flag ensures the continuation is
+            // resumed exactly once. Returns true only for the caller that wins.
+            let resumed = Mutex(false)
+            @Sendable func claimResume() -> Bool {
+                resumed.withLock { done in
+                    guard !done else { return false }
+                    done = true
+                    return true
+                }
+            }
             connection.stateUpdateHandler = { state in
-                guard !resumed else { return }
                 switch state {
                 case .ready:
-                    resumed = true
-                    continuation.resume()
+                    if claimResume() { continuation.resume() }
                 case .failed(let error):
-                    resumed = true
-                    continuation.resume(throwing: error)
+                    if claimResume() { continuation.resume(throwing: error) }
                 case .cancelled:
-                    resumed = true
-                    continuation.resume(throwing: DockerError.connectionCancelled)
+                    if claimResume() { continuation.resume(throwing: DockerError.connectionCancelled) }
                 default:
                     break
                 }
