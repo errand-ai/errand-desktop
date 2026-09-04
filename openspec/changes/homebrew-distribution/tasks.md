@@ -26,9 +26,9 @@
 
 ## 4. Homebrew tap repository
 
-- [ ] 4.1 Create the public repository `errand-ai/homebrew-errand` on GitHub. Add a top-level `README.md` with the install/upgrade instructions.
-- [ ] 4.2 Create `Casks/errand-desktop.rb` with `version`, `sha256`, `url` (pointing at `https://github.com/errand-ai/errand-desktop/releases/download/v#{version}/ErrandDesktop.dmg`), `name`, `desc`, `homepage`, `depends_on macos: ">= :sequoia"`, `app "ErrandDesktop.app"`, and a `livecheck` block targeting GitHub Releases.
-- [ ] 4.3 Validate the cask locally with `brew style --fix Casks/errand-desktop.rb` and `brew audit --cask --new errand-desktop` (or equivalent) before pushing.
+- [x] 4.1 Create the public repository `errand-ai/homebrew-errand` on GitHub. Add a top-level `README.md` with the install/upgrade instructions.
+- [x] 4.2 Create `Casks/errand-desktop.rb` with `version`, `sha256`, `url` (pointing at `https://github.com/errand-ai/errand-desktop/releases/download/v#{version}/ErrandDesktop.dmg`), `name`, `desc`, `homepage`, `depends_on macos: ">= :sequoia"`, `app "ErrandDesktop.app"`, and a `livecheck` block targeting GitHub Releases.
+- [x] 4.3 Validate the cask locally with `brew style --fix Casks/errand-desktop.rb` and `brew audit --cask --new errand-desktop` (or equivalent) before pushing.
 - [ ] 4.4 End-to-end install verification: on a Mac that has never installed ErrandDesktop, run `brew tap errand-ai/errand && brew install --cask errand-desktop`, confirm `/Applications/ErrandDesktop.app` is present, and launch the app.
 - [ ] 4.5 End-to-end upgrade verification: tag a patch release, confirm `brew upgrade --cask errand-desktop` picks up the new version on a previously-installed machine.
 
@@ -37,10 +37,10 @@
 - [x] 5.1 Update `README.md` in the errand-desktop repo with a "Install" section showing the Brew tap+install commands and the manual DMG fallback. Document the supported macOS / hardware matrix (Sequoia+ for Docker mode, Tahoe + Apple Silicon for Apple Containerization mode).
 - [x] 5.2 Update `README.md` with a "Upgrading" section explaining that Brew is the canonical upgrade channel.
 - [x] 5.3 Update `CLAUDE.md` to reflect the new minimum macOS, dual-runtime hardware support (Apple Silicon + Intel), Brew as the upgrade channel, and the `ErrandDesktop.dmg` naming contract.
-- [ ] 5.4 Update the homebrew tap repo's `README.md` with usage notes, link back to errand-desktop, and a brief "Why this tap exists" paragraph.
+- [x] 5.4 Update the homebrew tap repo's `README.md` with usage notes, link back to errand-desktop, and a brief "Why this tap exists" paragraph.
 
 ## 6. Release and announcement
 
-- [ ] 6.1 Cut the first release that meets all the new requirements: universal binary, `LSMinimumSystemVersion 15.0`, `ErrandDesktop.dmg` naming, signed and notarized.
-- [ ] 6.2 Update the cask in `errand-ai/homebrew-errand` to point at this release's tag and SHA. Push the cask update.
+- [x] 6.1 Cut the first release that meets all the new requirements: universal binary, `LSMinimumSystemVersion 15.0`, `ErrandDesktop.dmg` naming, signed and notarized.
+- [x] 6.2 Update the cask in `errand-ai/homebrew-errand` to point at this release's tag and SHA. Push the cask update.
 - [ ] 6.3 Announce the new install path (in the project README, release notes, and any user-facing channels). Note that existing users will see the in-app banner directing them to `brew upgrade` after the next release.
