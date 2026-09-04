@@ -75,7 +75,11 @@ jobs:
           </dict>
           </plist>
           PLIST
-          cp ErrandDesktop.entitlements "ErrandDesktop.app/Contents/"
+          # NB: do NOT copy ErrandDesktop.entitlements into Contents/. A loose file
+          # directly in Contents/ is treated by codesign as a subcomponent it must
+          # seal as code, which fails ("code object is not signed at all"). The
+          # entitlements are embedded into the signature from the repo-root copy via
+          # --entitlements below; nothing reads the file at runtime.
 
           # Create the resource bundle with app resources (icons, images).
           # SPM resources are excluded from the target; we manage the bundle ourselves
@@ -136,13 +140,17 @@ jobs:
         run: |
           # Sign the universal binary in place first, then the .app wrapper.
           # Both slices are covered by a single signature on the fat Mach-O.
-          codesign --force --verify --verbose \
+          #
+          # No --verify on these two: given a path inside a bundle, codesign verifies
+          # the enclosing bundle, which is not signed yet at this point. Verification
+          # happens once, below, after the wrapper is signed.
+          codesign --force --verbose \
             --sign "Developer ID Application" \
             --options runtime \
             --entitlements ErrandDesktop.entitlements \
             "ErrandDesktop.app/Contents/MacOS/ErrandDesktop"
 
-          codesign --force --verify --verbose \
+          codesign --force --verbose \
             --sign "Developer ID Application" \
             --options runtime \
             --entitlements ErrandDesktop.entitlements \
@@ -150,6 +158,15 @@ jobs:
 
           codesign -dvv "ErrandDesktop.app"
           codesign --verify --strict --verbose=2 "ErrandDesktop.app"
+
+          # The virtualization entitlement is what lets the app create VMs. If it is
+          # missing from the embedded signature, Apple Containerization is dead on
+          # arrival on Tahoe — and nothing else in the pipeline would notice.
+          if ! codesign -d --entitlements - --xml "ErrandDesktop.app" 2>/dev/null \
+               | grep -q "com.apple.security.virtualization"; then
+            echo "error: com.apple.security.virtualization missing from the signature" >&2
+            exit 1
+          fi
 
       - name: Create DMG
         run: |
