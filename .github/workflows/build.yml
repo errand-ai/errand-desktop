@@ -62,6 +62,8 @@ jobs:
               <string>sh.errand.desktop</string>
               <key>CFBundleName</key>
               <string>ErrandDesktop</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
               <key>CFBundleVersion</key>
               <string>${VERSION}</string>
               <key>CFBundleShortVersionString</key>
@@ -104,6 +106,15 @@ jobs:
           MIN="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' 'ErrandDesktop.app/Contents/Info.plist')"
           if [[ "$MIN" != "15.0" ]]; then
             echo "error: LSMinimumSystemVersion is '$MIN', expected '15.0'" >&2
+            exit 1
+          fi
+
+          # Without CFBundlePackageType=APPL, Gatekeeper does not treat the bundle as
+          # an application: spctl --assess --type execute reports "the code is valid
+          # but does not seem to be an app".
+          PKG="$(/usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' 'ErrandDesktop.app/Contents/Info.plist')"
+          if [[ "$PKG" != "APPL" ]]; then
+            echo "error: CFBundlePackageType is '$PKG', expected 'APPL'" >&2
             exit 1
           fi
 
