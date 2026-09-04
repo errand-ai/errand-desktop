@@ -4,7 +4,7 @@ Defines how the app detects, presents, and persists the choice of container runt
 ## Requirements
 
 ### Requirement: Runtime auto-detection
-The system SHALL detect available container runtimes on startup based on macOS version, CPU architecture, and installed software.
+The system SHALL detect available container runtimes on startup based on macOS version, CPU architecture, and installed software. The minimum macOS version on which the app itself launches is Sequoia (15); auto-detection runs on every supported host.
 
 #### Scenario: macOS 26 + Apple Silicon with Docker installed
 - **WHEN** the app starts on macOS 26 with Apple Silicon and Docker is installed
@@ -17,8 +17,18 @@ The system SHALL detect available container runtimes on startup based on macOS v
 - **THEN** Apple Containerization is auto-selected
 
 #### Scenario: Older macOS or Intel with Docker installed
-- **WHEN** the app starts on macOS < 26 or Intel hardware and Docker is installed
+- **WHEN** the app starts on macOS 15–25 or on Intel hardware, and Docker is installed
 - **THEN** only Docker is reported as available
+- **THEN** Docker is auto-selected
+
+#### Scenario: Sequoia on Apple Silicon with Docker installed
+- **WHEN** the app starts on macOS 15 (Sequoia) with Apple Silicon and Docker is installed
+- **THEN** only Docker is reported as available (Apple Containerization is hidden because it requires macOS 26)
+- **THEN** Docker is auto-selected
+
+#### Scenario: Sequoia or later on Intel with Docker installed
+- **WHEN** the app starts on macOS 15+ with Intel hardware and Docker is installed
+- **THEN** only Docker is reported as available (Apple Containerization is hidden because it requires Apple Silicon)
 - **THEN** Docker is auto-selected
 
 #### Scenario: No runtime available
