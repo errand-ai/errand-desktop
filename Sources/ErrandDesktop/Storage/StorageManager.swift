@@ -1,6 +1,4 @@
 import Foundation
-import ContainerizationEXT4
-import SystemPackage
 
 /// Manages persistent storage in ~/Library/Application Support/ErrandDesktop/
 class StorageManager {
@@ -10,7 +8,8 @@ class StorageManager {
     private let appSupportDir: URL
 
     /// Data directory for container volume mounts.
-    private let dataDir: URL
+    /// Internal (not private) so `AppleStorageHelpers` can reach it.
+    let dataDir: URL
 
     /// Path to the persisted config.json file.
     private let configFileURL: URL
@@ -59,31 +58,6 @@ class StorageManager {
     /// Returns the host path for a service's data volume (virtiofs shares).
     func dataPath(for serviceId: String) -> String {
         dataDir.appendingPathComponent(serviceId).path
-    }
-
-    // MARK: - Ext4 Disk Images
-
-    /// Returns the path to a service's ext4 disk image, creating it if needed.
-    /// Used for services like postgres and valkey that need full filesystem control.
-    func ensureDataDisk(for serviceId: String, sizeInMB: Int) throws -> String {
-        let disksDir = dataDir.appendingPathComponent("disks")
-        try fm.createDirectory(at: disksDir, withIntermediateDirectories: true)
-
-        let diskPath = disksDir.appendingPathComponent("\(serviceId).img")
-
-        if fm.fileExists(atPath: diskPath.path) {
-            print("[StorageManager] Using existing disk image: \(diskPath.path)")
-            return diskPath.path
-        }
-
-        print("[StorageManager] Creating \(sizeInMB)MB ext4 disk image for \(serviceId)...")
-        let sizeInBytes = UInt64(sizeInMB) * 1024 * 1024
-        let filePath = FilePath(diskPath.path)
-        let formatter = try EXT4.Formatter(filePath, minDiskSize: sizeInBytes)
-        try formatter.close()
-        print("[StorageManager] Disk image created: \(diskPath.path)")
-
-        return diskPath.path
     }
 
     // MARK: - Config Persistence

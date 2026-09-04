@@ -159,6 +159,14 @@ class AppState: ObservableObject {
                 runtime = DockerRuntime(socketPath: socketPath)
                 appendLog(service: "system", message: "Docker socket: \(socketPath)")
             case .appleContainerization:
+                // RuntimeDetector only reports this capability on macOS 26 + Apple Silicon,
+                // but the compiler still needs the availability guard here.
+                guard #available(macOS 26, *) else {
+                    let msg = "Apple Containerization requires macOS 26 on Apple Silicon."
+                    runtimeError = msg
+                    appendLog(service: "system", message: msg)
+                    return
+                }
                 runtime = AppleContainerRuntime()
             }
             try await containerEngine?.setRuntime(runtime, capability: chosen)

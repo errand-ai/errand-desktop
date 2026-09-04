@@ -1,12 +1,60 @@
 # ErrandDesktop
 
-A native macOS menu bar app that runs the [Errand](https://github.com/errand-ai/errand-ai) stack locally using Apple's [Containerization](https://github.com/apple/swift-containerization) framework. Manages PostgreSQL, Valkey, Backend, and Worker as lightweight VM-based containers on Apple silicon — no Docker required.
+A native macOS menu bar app that runs the [Errand](https://github.com/errand-ai/errand-ai) stack locally. Manages PostgreSQL, Valkey, Backend, and Worker as containers via either Docker (any supported Mac) or Apple's [Containerization](https://github.com/apple/swift-containerization) framework (macOS 26 + Apple silicon, no Docker required).
+
+## Install
+
+```bash
+brew tap errand-ai/errand
+brew trust errand-ai/errand          # Homebrew 6+ only; see note below
+brew install --cask errand-desktop
+```
+
+These are one-time steps. After that, `brew upgrade --cask errand-desktop` keeps the
+app current.
+
+Homebrew 6 refuses to load casks from a non-official tap until you trust it — the
+`brew trust` line is what grants that. On Homebrew 5 and earlier the command does not
+exist and is not needed; skip it.
+
+If you would rather not use Homebrew, download `ErrandDesktop.dmg` from the
+[latest release](https://github.com/errand-ai/errand-desktop/releases/latest),
+open it, and drag `ErrandDesktop.app` into `/Applications`. The DMG is signed and
+notarized, so it launches without a Gatekeeper override.
+
+## Upgrading
+
+Homebrew is the canonical upgrade channel:
+
+```bash
+brew upgrade --cask errand-desktop
+```
+
+The app does not update itself. It checks GitHub Releases roughly once a day and
+posts a notification when a newer version exists — Homebrew users run the command
+above, manual installers click the notification to open the release page and
+replace `/Applications/ErrandDesktop.app` with the new DMG.
 
 ## Requirements
 
-- macOS 26+ (Tahoe)
-- Apple silicon (M1 or later)
-- Swift 6.1+
+A single universal (`arm64` + `x86_64`) build covers every supported Mac; there is
+nothing architecture-specific to choose at install time.
+
+| Hardware | macOS | Docker runtime | Apple Containerization |
+| --- | --- | --- | --- |
+| Apple silicon | 26+ (Tahoe) | Yes | Yes |
+| Apple silicon | 15 (Sequoia) | Yes | No — requires macOS 26 |
+| Intel | 15+ (Sequoia) | Yes | No — requires Apple silicon |
+| Any | 14 and earlier | Not supported | Not supported |
+
+macOS 15 (Sequoia) is the floor: the upstream `swift-containerization` package
+declares its own `.macOS("15")` minimum, and SwiftPM minimums apply at link time
+regardless of `@available` gating.
+
+Docker mode needs a Docker-compatible socket — Docker Desktop, Colima, OrbStack, or
+Rancher Desktop all work.
+
+Building from source additionally requires Swift 6.2+.
 
 ## Features
 
@@ -43,11 +91,17 @@ swift test
 
 ## Distribution
 
-Release builds are signed, notarized, and packaged as a DMG via CI:
+Every tagged release publishes exactly one asset — `ErrandDesktop.dmg` — containing
+a universal `.app`. The filename is a contract: the Homebrew cask in
+[`errand-ai/homebrew-errand`](https://github.com/errand-ai/homebrew-errand) resolves
+`releases/download/v<version>/ErrandDesktop.dmg`, so no architecture or version
+suffix may be added.
+
+CI builds, signs, notarizes, and publishes it. To reproduce locally:
 
 ```bash
-# Build release binary
-swift build -c release
+# Build both slices and merge them into one universal binary
+scripts/build-universal.sh .build/universal/ErrandDesktop
 
 # Create DMG (after building the app bundle)
 scripts/create-dmg.sh ErrandDesktop.app ErrandDesktop.dmg

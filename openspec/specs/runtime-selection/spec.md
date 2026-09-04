@@ -1,4 +1,4 @@
-## ADDED Requirements
+## Requirements
 
 ### Requirement: Runtime auto-detection
 The system SHALL detect available container runtimes on startup based on macOS version, CPU architecture, and installed software.
