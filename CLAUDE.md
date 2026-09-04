@@ -4,7 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-ErrandDesktop is a native macOS menu bar app (Swift 6.2, macOS 26+/Tahoe, Apple silicon only) that runs the [Errand](https://github.com/errand-ai/errand-ai) stack locally using Apple's [Containerization](https://github.com/apple/swift-containerization) framework. It manages PostgreSQL, Valkey, Backend, and Worker as lightweight VM-based containers — no Docker required.
+ErrandDesktop is a native macOS menu bar app (Swift 6.2, macOS 15+/Sequoia, universal `arm64` + `x86_64`) that runs the [Errand](https://github.com/errand-ai/errand-ai) stack locally. It manages PostgreSQL, Valkey, Backend, and Worker as containers through one of two runtimes:
+
+- **Docker** — any supported Mac (Apple silicon or Intel, macOS 15+). Talks to any Docker-compatible socket: Docker Desktop, Colima, OrbStack, Rancher Desktop.
+- **Apple Containerization** — macOS 26 (Tahoe) on Apple silicon only. Lightweight VM-based containers, no Docker required.
+
+macOS 15 is the floor because the upstream `swift-containerization` package declares its own `.macOS("15")` minimum, and SwiftPM minimums apply at link time regardless of `@available` gating. The dependency is pinned to `"0.26.0"..<"0.27.0"` in `Package.swift` so a minor bump cannot silently raise that floor.
+
+### macOS 26 availability gating
+
+The app deploys to macOS 15, so every Apple Containerization symbol must be gated:
+
+- `AppleContainerRuntime` (the whole actor) is `@available(macOS 26, *)`.
+- Ext4 disk image creation lives in `Sources/ErrandDesktop/Storage/AppleStorageHelpers.swift` — a `@available(macOS 26, *)` extension on `StorageManager` — so `StorageManager` itself carries no `ContainerizationEXT4` dependency.
+- Every `as? AppleContainerRuntime` cast in `ContainerEngine`, and the construction site in `AppState`, is wrapped in `if #available(macOS 26, *)` / `guard #available(macOS 26, *)`.
+
+When adding code that touches `Containerization`, `ContainerizationOCI`, or `ContainerizationEXT4`, put it behind one of those gates — an ungated reference breaks the Sequoia build.
 
 ## Build & Run Commands
 
@@ -69,9 +84,18 @@ HTTP parsing is hand-rolled in `HTTPTypes.swift` (no external HTTP server depend
 - The app is a `MenuBarExtra` with `.window` style — no dock icon (`LSUIElement = true`).
 - Resources (menu bar icons) are in `Sources/ErrandDesktop/Resources/` and accessed via `Bundle.module`.
 
-## CI
+## CI & Distribution
 
-GitHub Actions (`.github/workflows/build.yml`): builds on macOS 15, runs tests, then for main/tags creates a signed+notarized DMG release.
+GitHub Actions (`.github/workflows/build.yml`) builds and tests, then for main/tags produces a signed+notarized release on an Apple silicon runner.
+
+- `scripts/build-universal.sh` builds the `arm64` and `x86_64` slices with identical flags and merges them with `lipo -create`. The `x86_64` slice is cross-compiled — no Intel runner is required.
+- The bundled `Info.plist` sets `LSMinimumSystemVersion` to `15.0`; the workflow fails the build if it does not.
+- **Naming contract**: each release publishes exactly one asset, named `ErrandDesktop.dmg` — no architecture or version suffix. The Homebrew cask resolves `releases/download/v<version>/ErrandDesktop.dmg`, so changing the filename breaks every install and upgrade.
+- Tags are `v<semver>` and must match the `CFBundleShortVersionString` baked into the bundle.
+
+**Homebrew is the canonical upgrade channel.** The cask lives in the separate public tap repo [`errand-ai/homebrew-errand`](https://github.com/errand-ai/homebrew-errand) at `Casks/errand-desktop.rb`; users install with `brew tap errand-ai/errand && brew install --cask errand-desktop` and upgrade with `brew upgrade --cask errand-desktop`. After cutting a release, the cask's `version` and `sha256` must be updated in that repo.
+
+The app does not self-update. `UpdateChecker` polls `errand-ai/errand-desktop` releases and posts a notification only.
 
 ## Serena (Code Intelligence)
 

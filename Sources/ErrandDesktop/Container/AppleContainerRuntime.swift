@@ -31,6 +31,11 @@ private final class DebugWriter: Writer, @unchecked Sendable {
 
 /// Apple Containerization framework implementation of the ContainerRuntime protocol.
 /// Manages lightweight Linux VMs using Apple's native Containerization APIs.
+///
+/// Apple's Containerization framework requires macOS 26 (Tahoe) on Apple Silicon.
+/// The app itself deploys to macOS 15, so every use of this type must be guarded
+/// by `if #available(macOS 26, *)` (see `RuntimeDetector.isAppleContainerizationAvailable`).
+@available(macOS 26, *)
 actor AppleContainerRuntime: ContainerRuntime {
 
     /// The shared ContainerManager that owns the VM network and kernel.

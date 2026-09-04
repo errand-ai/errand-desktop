@@ -16,8 +16,12 @@ class UpdateChecker: ObservableObject {
     }
 
     /// Repository path for the GitHub Releases API.
-    /// Update this to match your org/repo.
-    static let repoPath = "errand/errand-desktop"
+    static let repoPath = "errand-ai/errand-desktop"
+
+    /// The GitHub Releases endpoint polled by `checkForUpdate`.
+    static var latestReleaseURL: URL? {
+        URL(string: "https://api.github.com/repos/\(repoPath)/releases/latest")
+    }
 
     /// Starts periodic update checks — on launch and every 24 hours.
     func startPeriodicChecks() {
@@ -40,8 +44,7 @@ class UpdateChecker: ObservableObject {
 
     /// Checks the GitHub Releases API for a newer version.
     func checkForUpdate() async {
-        let urlString = "https://api.github.com/repos/\(Self.repoPath)/releases/latest"
-        guard let url = URL(string: urlString) else { return }
+        guard let url = Self.latestReleaseURL else { return }
 
         do {
             var request = URLRequest(url: url)
@@ -97,7 +100,10 @@ class UpdateChecker: ObservableObject {
 
         let content = UNMutableNotificationContent()
         content.title = "Update Available"
-        content.body = "ErrandDesktop \(version) is available. Click to download."
+        // Install-path agnostic: Brew users upgrade in place, manual installers click
+        // through to the release page (the click action below still opens it).
+        content.body = "ErrandDesktop \(version) is available. "
+            + "Run `brew upgrade --cask errand-desktop`, or visit the release page."
         content.sound = .default
 
         let request = UNNotificationRequest(

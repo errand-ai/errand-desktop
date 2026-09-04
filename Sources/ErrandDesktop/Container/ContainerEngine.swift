@@ -277,7 +277,7 @@ actor ContainerEngine {
         case .docker:
             hostGatewayIP = "host.docker.internal"
         case .appleContainerization:
-            if let appleRuntime = runtime as? AppleContainerRuntime {
+            if #available(macOS 26, *), let appleRuntime = runtime as? AppleContainerRuntime {
                 try await appleRuntime.ensureInitialized()
                 hostGatewayIP = await appleRuntime.hostGatewayIP
             }
@@ -406,7 +406,7 @@ actor ContainerEngine {
     /// Returns true if the container process for a service has exited unexpectedly.
     func hasExited(serviceId: String) async -> Bool {
         guard let containerId = serviceContainerMap[serviceId] else { return false }
-        if let appleRuntime = runtime as? AppleContainerRuntime {
+        if #available(macOS 26, *), let appleRuntime = runtime as? AppleContainerRuntime {
             return await appleRuntime.hasExited(id: containerId)
         }
         if let dockerRuntime = runtime as? DockerRuntime {
@@ -708,7 +708,8 @@ actor ContainerEngine {
 
     /// Waits for a container to exit and returns its exit code.
     private func waitForContainerExit(containerId: String, timeout: Int) async throws -> Int {
-        if let appleRuntime = runtime as? AppleContainerRuntime,
+        if #available(macOS 26, *),
+           let appleRuntime = runtime as? AppleContainerRuntime,
            let container = await appleRuntime.getContainer(id: containerId) {
             let status = try await container.wait()
             return Int(status.exitCode)
@@ -910,7 +911,8 @@ actor ContainerEngine {
     /// Monitors a task container for exit — uses Apple container.wait() when available,
     /// falls back to polling Docker inspect API.
     private func monitorTaskContainerExit(containerId: String) async {
-        if let appleRuntime = runtime as? AppleContainerRuntime,
+        if #available(macOS 26, *),
+           let appleRuntime = runtime as? AppleContainerRuntime,
            let container = await appleRuntime.getContainer(id: containerId) {
             do {
                 let exitStatus = try await container.wait()
@@ -1000,7 +1002,7 @@ actor ContainerEngine {
                     continuation.finish(throwing: error)
                 }
             }
-        } else if let appleRuntime = runtime as? AppleContainerRuntime {
+        } else if #available(macOS 26, *), let appleRuntime = runtime as? AppleContainerRuntime {
             Task {
                 do {
                     let appleStream = try await appleRuntime.containerLogs(id: id)
@@ -1333,6 +1335,7 @@ actor ContainerEngine {
                 // (chown failures) that occur with bind mounts on some systems.
                 return ["errand-postgres-data": "/var/lib/postgresql/data"]
             } else {
+                guard #available(macOS 26, *) else { return [:] }
                 let diskPath = (try? storageManager.ensureDataDisk(for: "postgres", sizeInMB: 1024)) ?? ""
                 return [diskPath: "/var/lib/postgresql/data"]
             }
@@ -1340,6 +1343,7 @@ actor ContainerEngine {
             if isDockerRuntime {
                 return ["errand-valkey-data": "/data"]
             } else {
+                guard #available(macOS 26, *) else { return [:] }
                 let diskPath = (try? storageManager.ensureDataDisk(for: "valkey", sizeInMB: 256)) ?? ""
                 return [diskPath: "/data"]
             }

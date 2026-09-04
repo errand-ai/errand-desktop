@@ -21,26 +21,21 @@ jobs:
         run: swift test
 
   release:
-    name: Release (${{ matrix.arch }})
+    name: Release (universal)
     needs: build-and-test
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    # Apple Silicon runner: the x86_64 slice is cross-compiled, so no Intel runner
+    # is required. The toolchain here must be able to target macOS 15 (Sequoia).
     runs-on: m4-max
     permissions:
       contents: write
-    strategy:
-      matrix:
-        include:
-          - arch: arm64
-            swift_arch: arm64
-            dmg_suffix: apple-silicon
-          - arch: x86_64
-            swift_arch: x86_64
-            dmg_suffix: intel
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build release binary
-        run: swift build -c release --arch ${{ matrix.swift_arch }}
+      - name: Build universal release binary
+        run: |
+          chmod +x scripts/build-universal.sh
+          scripts/build-universal.sh .build/universal/ErrandDesktop
 
       - name: Create app bundle
         env:
@@ -48,7 +43,7 @@ jobs:
         run: |
           APP_DIR="ErrandDesktop.app/Contents/MacOS"
           mkdir -p "$APP_DIR"
-          cp .build/release/ErrandDesktop "$APP_DIR/"
+          cp .build/universal/ErrandDesktop "$APP_DIR/"
 
           TAG="$REF_NAME"
           VERSION="${TAG#v}"
@@ -72,7 +67,7 @@ jobs:
               <key>CFBundleShortVersionString</key>
               <string>${VERSION}</string>
               <key>LSMinimumSystemVersion</key>
-              <string>26.0</string>
+              <string>15.0</string>
               <key>LSUIElement</key>
               <true/>
               <key>CFBundleIconFile</key>
@@ -90,6 +85,23 @@ jobs:
           mkdir -p "$BUNDLE_DIR"
           cp Sources/ErrandDesktop/Resources/*.png "$BUNDLE_DIR/"
           cp Sources/ErrandDesktop/Resources/AppIcon.icns "$RESOURCES_DIR/"
+
+      - name: Verify bundle is universal and targets macOS 15
+        run: |
+          lipo -info "ErrandDesktop.app/Contents/MacOS/ErrandDesktop"
+          ARCHS="$(lipo -archs 'ErrandDesktop.app/Contents/MacOS/ErrandDesktop')"
+          for expected in arm64 x86_64; do
+            case " $ARCHS " in
+              *" $expected "*) ;;
+              *) echo "error: app binary is missing the $expected slice (got: $ARCHS)" >&2; exit 1 ;;
+            esac
+          done
+
+          MIN="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' 'ErrandDesktop.app/Contents/Info.plist')"
+          if [[ "$MIN" != "15.0" ]]; then
+            echo "error: LSMinimumSystemVersion is '$MIN', expected '15.0'" >&2
+            exit 1
+          fi
 
       - name: Import signing certificate
         env:
@@ -122,51 +134,62 @@ jobs:
 
       - name: Sign app bundle
         run: |
-          codesign --deep --force --verify --verbose \
+          # Sign the universal binary in place first, then the .app wrapper.
+          # Both slices are covered by a single signature on the fat Mach-O.
+          codesign --force --verify --verbose \
+            --sign "Developer ID Application" \
+            --options runtime \
+            --entitlements ErrandDesktop.entitlements \
+            "ErrandDesktop.app/Contents/MacOS/ErrandDesktop"
+
+          codesign --force --verify --verbose \
             --sign "Developer ID Application" \
             --options runtime \
             --entitlements ErrandDesktop.entitlements \
             "ErrandDesktop.app"
 
+          codesign -dvv "ErrandDesktop.app"
+          codesign --verify --strict --verbose=2 "ErrandDesktop.app"
+
       - name: Create DMG
-        env:
-          DMG_SUFFIX: ${{ matrix.dmg_suffix }}
         run: |
           chmod +x scripts/create-dmg.sh
-          scripts/create-dmg.sh ErrandDesktop.app "ErrandDesktop-${DMG_SUFFIX}.dmg"
+          scripts/create-dmg.sh ErrandDesktop.app ErrandDesktop.dmg
 
       - name: Sign DMG
-        env:
-          DMG_SUFFIX: ${{ matrix.dmg_suffix }}
         run: |
           codesign --force --verify --verbose \
             --sign "Developer ID Application" \
-            "ErrandDesktop-${DMG_SUFFIX}.dmg"
+            ErrandDesktop.dmg
 
       - name: Notarize
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           TEAM_ID: ${{ secrets.TEAM_ID }}
-          DMG_SUFFIX: ${{ matrix.dmg_suffix }}
         run: |
-          xcrun notarytool submit "ErrandDesktop-${DMG_SUFFIX}.dmg" \
+          xcrun notarytool submit ErrandDesktop.dmg \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_PASSWORD" \
             --team-id "$TEAM_ID" \
             --wait
 
-          xcrun stapler staple "ErrandDesktop-${DMG_SUFFIX}.dmg"
+          xcrun stapler staple ErrandDesktop.dmg
+
+      - name: Verify Gatekeeper acceptance
+        run: |
+          spctl --assess --type install --verbose=4 ErrandDesktop.dmg
+          spctl --assess --type execute --verbose=4 "ErrandDesktop.app"
 
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v7
         with:
-          name: ErrandDesktop-${{ matrix.dmg_suffix }}.dmg
-          path: "ErrandDesktop-${{ matrix.dmg_suffix }}.dmg"
+          name: ErrandDesktop.dmg
+          path: ErrandDesktop.dmg
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v3
         with:
-          files: "ErrandDesktop-${{ matrix.dmg_suffix }}.dmg"
+          files: ErrandDesktop.dmg
           generate_release_notes: true

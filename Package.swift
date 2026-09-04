@@ -5,13 +5,15 @@ import PackageDescription
 let package = Package(
     name: "ErrandDesktop",
     platforms: [
-        .macOS(.v26)
+        .macOS(.v15)
     ],
     products: [
         .executable(name: "ErrandDesktop", targets: ["ErrandDesktop"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/containerization.git", from: "0.26.0"),
+        // Pinned to a tight range: the package declares its own `.macOS("15")` floor,
+        // and a future minor bump could silently raise our minimum deployment target.
+        .package(url: "https://github.com/apple/containerization.git", "0.26.0"..<"0.27.0"),
     ],
     targets: [
         .executableTarget(
