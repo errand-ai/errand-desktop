@@ -1,3 +1,6 @@
+## Purpose
+Defines how the app detects, presents, and persists the choice of container runtime.
+
 ## Requirements
 
 ### Requirement: Runtime auto-detection

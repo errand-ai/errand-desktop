@@ -1,4 +1,7 @@
-## ADDED Requirements
+## Purpose
+Defines the runtime-agnostic ContainerRuntime protocol and the shared behaviour every backend must provide: image resolution, health checks, inter-container networking, and task-runner environment wiring.
+
+## Requirements
 
 ### Requirement: ContainerRuntime protocol
 The system SHALL define a `ContainerRuntime` protocol that abstracts all container lifecycle operations, allowing multiple backend implementations (Docker, Apple Containerization).

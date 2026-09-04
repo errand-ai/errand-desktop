@@ -1,4 +1,7 @@
-## MODIFIED Requirements
+## Purpose
+Defines the Agent Memory step of the setup wizard: how model dropdowns are populated and filtered from the LLM endpoint, and how the choices reach the Hindsight container and the Settings tab.
+
+## Requirements
 
 ### Requirement: Agent Memory step in setup wizard
 The setup wizard SHALL include an Agent Memory step with a "Use Hindsight for Agent Memory" toggle that defaults to on. A brief description SHALL explain that Hindsight provides persistent memory for AI agents, with a link to https://errand.sh/docs/ai-memory/ for more information.

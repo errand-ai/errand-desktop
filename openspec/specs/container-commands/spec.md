@@ -1,4 +1,7 @@
-## MODIFIED Requirements
+## Purpose
+Defines how services override a container's default command, and how ephemeral one-shot containers such as the migration runner are executed.
+
+## Requirements
 
 ### Requirement: Custom container command override
 Containers can be started with a custom command that overrides the image's default CMD. The command is passed through the active `ContainerRuntime` protocol rather than directly to Apple Containerization.

@@ -1,4 +1,7 @@
-## MODIFIED Requirements
+## Purpose
+Defines the environment the Hindsight memory service requires from the host app in order to start.
+
+## Requirements
 
 ### Requirement: Hindsight receives required environment variables
 The hindsight container SHALL receive environment variables for database access, LLM routing, and model configuration. LLM API keys SHALL be scoped hindsight service keys rather than the LiteLLM master key.
