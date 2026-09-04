@@ -1,4 +1,7 @@
-## ADDED Requirements
+## Purpose
+Defines how the app probes a configured LLM endpoint to identify its provider type, when detection re-runs, and how the result is persisted.
+
+## Requirements
 
 ### Requirement: Provider type detection via HTTP probing
 The system SHALL detect the type of an external LLM provider by probing its HTTP endpoints. Detection SHALL try LiteLLM first, then OpenAI-compatible, then fall back to unknown.

@@ -1,4 +1,7 @@
-## MODIFIED Requirements
+## Purpose
+Defines the LLM step of the setup wizard: the LiteLLM toggle and its conditional fields, inline container startup, indexed provider env vars, and how Settings mirrors the wizard.
+
+## Requirements
 
 ### Requirement: LiteLLM is enabled by default in setup wizard
 The LLM Configuration step SHALL display a radio choice between "Deploy LiteLLM locally" (selected by default, recommended) and "Connect to an existing provider". A brief description SHALL explain the choice, with a link to https://errand.sh/docs/ai-models/ for more information.
@@ -116,9 +119,3 @@ The setup wizard SHALL have the same number of steps as currently, with the LLM 
 #### Scenario: Step indicator reflects current flow
 - **WHEN** the setup wizard is displayed
 - **THEN** the step indicator reflects the total steps, hiding the LiteLLM startup step when deploying locally is not selected
-
-## REMOVED Requirements
-
-### Requirement: LiteLLM disabled falls back to direct config
-**Reason**: Replaced by indexed `LLM_PROVIDER_0_*` env var injection for all provider modes. The old `OPENAI_BASE_URL`/`OPENAI_API_KEY` format is no longer used by errand-server.
-**Migration**: Backend and worker containers now receive `LLM_PROVIDER_0_NAME`, `LLM_PROVIDER_0_BASE_URL`, and `LLM_PROVIDER_0_API_KEY` regardless of deployment mode.

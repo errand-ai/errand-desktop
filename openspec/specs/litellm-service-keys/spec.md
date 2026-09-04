@@ -1,4 +1,7 @@
-## ADDED Requirements
+## Purpose
+Defines how per-service LiteLLM API keys and the Postgres password are provisioned, stored, injected into containers, and migrated, so that no service shares the master key.
+
+## Requirements
 
 ### Requirement: Service key provisioning after LiteLLM healthy
 The app SHALL generate two scoped LiteLLM virtual API keys via `POST /key/generate` after LiteLLM passes its health check, before any dependent service (Backend, Worker, Hindsight) starts.

@@ -1,4 +1,7 @@
-## ADDED Requirements
+## Purpose
+Defines the Playwright MCP container service: how it runs in isolated mode, how its health is checked, and how its URL reaches dependent services.
+
+## Requirements
 
 ### Requirement: Playwright MCP container service
 

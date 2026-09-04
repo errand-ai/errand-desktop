@@ -1,4 +1,7 @@
-## ADDED Requirements
+## Purpose
+Defines the security posture of the local BridgeServer: which peers may connect, how requests are authenticated and bounded, and how its state is isolated.
+
+## Requirements
 
 ### Requirement: BridgeServer rejects connections from non-local peers
 The BridgeServer SHALL validate the remote address of every incoming TCP connection and immediately close connections that do not originate from 127.0.0.1 or the host's active vmnet gateway address. When the runtime exposes no numeric gateway address (Docker, whose gateway is the name `host.docker.internal`), the BridgeServer SHALL instead accept only peers whose address falls in an RFC 1918 private range.

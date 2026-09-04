@@ -1,4 +1,7 @@
-## ADDED Requirements
+## Purpose
+Defines how the Google Drive and OneDrive MCP servers are configured, toggled, launched, and health-checked as optional desktop services.
+
+## Requirements
 
 ### Requirement: Google Drive MCP server config toggle
 

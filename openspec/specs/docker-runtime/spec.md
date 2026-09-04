@@ -1,4 +1,7 @@
-## ADDED Requirements
+## Purpose
+Defines the Docker backend's implementation of the container runtime: Engine API access over the socket, container lifecycle, port publishing, volumes, networking, exec, and image pulls.
+
+## Requirements
 
 ### Requirement: Docker Engine API client
 The system SHALL communicate with the Docker Engine via its HTTP REST API over the Unix socket at `/var/run/docker.sock`.
