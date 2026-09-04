@@ -20,9 +20,52 @@ jobs:
       - name: Test
         run: swift test
 
+  # The self-hosted runner above is Tahoe. Since the app now deploys to macOS 15,
+  # build and run the tests on an actual Sequoia host too.
+  #
+  # Swift's availability checking keys off the deployment target, not the host, so
+  # ungated macOS 26 API is already a compile error on Tahoe. What this job adds is
+  # a *runtime* check: the test binary links the whole module, including
+  # AppleContainerRuntime, so if a macOS 26 symbol were ever referenced eagerly
+  # rather than behind `if #available`, the process would fail to load here and
+  # pass on Tahoe. It also proves a contributor on the minimum supported OS can
+  # build the repo at all.
+  build-sequoia:
+    name: Build & Test (Sequoia)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Select Xcode 26
+        run: |
+          # The macos-15 image defaults to Xcode 16.4, whose Swift 6.1 cannot parse
+          # `swift-tools-version: 6.2`. Pick the newest Xcode 26.x present rather
+          # than pinning an exact version, since the image is updated regularly.
+          XCODE="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)"
+          if [[ -z "$XCODE" ]]; then
+            echo "error: no Xcode 26.x on this runner image." >&2
+            echo "swift-tools-version 6.2 requires it, and swift-containerization" >&2
+            echo "needs the macOS 26 SDK for its @available(macOS 26, *) symbols." >&2
+            ls -d /Applications/Xcode*.app >&2
+            exit 1
+          fi
+          echo "Selecting $XCODE"
+          sudo xcode-select -s "$XCODE"
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          swift --version
+
+      - name: Build
+        run: swift build
+
+      - name: Test
+        run: swift test
+
   release:
     name: Release (universal)
-    needs: build-and-test
+    needs: [build-and-test, build-sequoia]
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     # Apple Silicon runner: the x86_64 slice is cross-compiled, so no Intel runner
     # is required. The toolchain here must be able to target macOS 15 (Sequoia).
