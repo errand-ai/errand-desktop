@@ -13,7 +13,7 @@ let package = Package(
     dependencies: [
         // Pinned to a tight range: the package declares its own `.macOS("15")` floor,
         // and a future minor bump could silently raise our minimum deployment target.
-        .package(url: "https://github.com/apple/containerization.git", "0.26.0"..<"0.27.0"),
+        .package(url: "https://github.com/apple/containerization.git", "0.26.0"..<"0.45.0"),
     ],
     targets: [
         .executableTarget(
